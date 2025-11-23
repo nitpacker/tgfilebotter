@@ -1,14 +1,17 @@
 """
-Telegram Bot API wrapper for file uploads (FIXED VERSION).
-FIXES: Proper admin check, error translation, streaming for large files
+Telegram Bot API wrapper for file uploads (SECURITY HARDENED).
 """
 
 import requests
 import os
 import time
+import logging
 from typing import Optional, Dict, Any, Callable
 from config import MAX_FILE_SIZE, UPLOAD_TIMEOUT
 
+# SECURITY FIX: Configure logging to not expose tokens
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class TelegramAPI:
     """Handles all Telegram Bot API interactions."""
@@ -19,6 +22,23 @@ class TelegramAPI:
         self.bot_token = bot_token
         self.api_url = f"{self.BASE_URL}{bot_token}"
         self._bot_info = None
+        # SECURITY FIX: Track token for sanitization in logs
+        self._token_prefix = bot_token[:8] if len(bot_token) > 8 else "****"
+    
+    def _sanitize_error(self, error_msg: str) -> str:
+        """SECURITY FIX: Remove token from error messages."""
+        if self.bot_token in str(error_msg):
+            error_msg = str(error_msg).replace(self.bot_token, f"{self._token_prefix}****")
+        return error_msg
+    
+    def _log_error(self, message: str, error: Exception = None):
+        """SECURITY FIX: Log errors without exposing tokens."""
+        sanitized_msg = self._sanitize_error(message)
+        if error:
+            sanitized_error = self._sanitize_error(str(error))
+            logger.error(f"{sanitized_msg}: {sanitized_error}")
+        else:
+            logger.error(sanitized_msg)
     
     def validate_token(self) -> Dict[str, Any]:
         """Validate bot token by calling getMe."""
@@ -37,20 +57,29 @@ class TelegramAPI:
                     'bot_id': self._bot_info.get('id')
                 }
             else:
+                # SECURITY FIX: Don't expose token in error
+                error_desc = data.get('description', 'Invalid token')
+                self._log_error(f"Token validation failed: {error_desc}")
                 return {
                     'valid': False,
-                    'error': data.get('description', 'Invalid token')
+                    'error': self._translate_error(error_desc)
                 }
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.Timeout:
+            self._log_error("Token validation timed out")
             return {
                 'valid': False,
-                'error': f"Connection error: {str(e)}"
+                'error': "Connection timed out. Please check your internet connection."
+            }
+        except requests.exceptions.RequestException as e:
+            self._log_error("Token validation request failed", e)
+            return {
+                'valid': False,
+                'error': f"Connection error: Please check your internet connection."
             }
     
     def check_channel_admin(self, channel_id: str) -> Dict[str, Any]:
         """
-        Check if bot is admin in the channel.
-        FIXED: Now properly verifies admin status with posting permissions.
+        Check if bot is admin in the channel with posting permissions.
         """
         try:
             # First, try to get chat info
@@ -62,16 +91,16 @@ class TelegramAPI:
             data = resp.json()
             
             if not data.get('ok'):
+                error_desc = data.get('description', 'Cannot access channel')
                 return {
                     'valid': False,
-                    'error': self._translate_error(data.get('description', 'Cannot access channel'))
+                    'error': self._translate_error(error_desc)
                 }
             
             chat_info = data['result']
             
-            # CRITICAL FIX: Must verify bot is actually admin
+            # Must verify bot is admin
             if not self._bot_info:
-                # Bot info should be loaded by validate_token first
                 return {
                     'valid': False,
                     'error': 'Bot information not available. Validate token first.'
@@ -89,16 +118,17 @@ class TelegramAPI:
             member_data = resp.json()
             
             if not member_data.get('ok'):
+                error_desc = member_data.get('description', 'Unknown error')
                 return {
                     'valid': False,
                     'error': self._translate_error(
-                        f"Cannot check bot status: {member_data.get('description', 'Unknown error')}"
+                        f"Cannot check bot status: {error_desc}"
                     )
                 }
             
             status = member_data['result'].get('status')
             
-            # FIXED: Only these statuses can post messages
+            # Only these statuses can post messages
             if status in ['administrator', 'creator']:
                 # Verify posting permissions for administrators
                 if status == 'administrator':
@@ -124,10 +154,17 @@ class TelegramAPI:
                            f'✓ Solution: Add bot as admin with posting rights in channel settings.'
                 }
             
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.Timeout:
+            self._log_error("Channel check timed out")
             return {
                 'valid': False,
-                'error': f"Connection error: {str(e)}"
+                'error': "Connection timed out. Please check your internet connection."
+            }
+        except requests.exceptions.RequestException as e:
+            self._log_error("Channel check request failed", e)
+            return {
+                'valid': False,
+                'error': "Connection error. Please check your internet connection."
             }
     
     def _translate_error(self, error_desc: str) -> str:
@@ -146,18 +183,18 @@ class TelegramAPI:
             if key in error_desc:
                 return friendly_msg
         
-        return error_desc  # Return original if no match
+        return error_desc
     
     def upload_file(
         self,
         channel_id: str,
         file_path: str,
-        progress_callback: Optional[Callable[[int, int], None]] = None
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        max_retries: int = 3
     ) -> Dict[str, Any]:
         """
-        Upload a file to the channel.
-        FIXED: Better error messages and memory optimization for large files.
-        Returns file_id and message_id on success.
+        Upload a file to the channel with retry logic.
+        SECURITY FIX: Exponential backoff and better error handling.
         """
         if not os.path.exists(file_path):
             return {'success': False, 'error': 'File not found'}
@@ -175,67 +212,100 @@ class TelegramAPI:
         
         file_name = os.path.basename(file_path)
         
-        try:
-            # For large files (>10MB), we could add streaming support
-            # For now, use standard upload (Telegram handles it well)
-            with open(file_path, 'rb') as f:
-                # Use sendDocument for all file types
-                files = {'document': (file_name, f)}
-                data = {'chat_id': channel_id}
+        # Retry with exponential backoff
+        for attempt in range(max_retries):
+            try:
+                with open(file_path, 'rb') as f:
+                    files = {'document': (file_name, f)}
+                    data = {'chat_id': channel_id}
+                    
+                    # SECURITY FIX: Adjust timeout based on file size
+                    timeout = min(UPLOAD_TIMEOUT, max(60, file_size / 1024 / 1024 * 2))
+                    
+                    resp = requests.post(
+                        f"{self.api_url}/sendDocument",
+                        data=data,
+                        files=files,
+                        timeout=timeout
+                    )
                 
-                resp = requests.post(
-                    f"{self.api_url}/sendDocument",
-                    data=data,
-                    files=files,
-                    timeout=UPLOAD_TIMEOUT
-                )
-            
-            result = resp.json()
-            
-            if result.get('ok'):
-                message = result['result']
-                doc = message.get('document', {})
+                result = resp.json()
                 
-                # Get file_id from the appropriate field
-                file_id = doc.get('file_id')
-                if not file_id:
-                    # Try other media types
-                    for media_type in ['video', 'audio', 'photo', 'animation']:
-                        media = message.get(media_type)
-                        if media:
-                            if isinstance(media, list):
-                                file_id = media[-1].get('file_id')  # Largest photo
-                            else:
-                                file_id = media.get('file_id')
-                            break
-                
-                return {
-                    'success': True,
-                    'file_id': file_id,
-                    'message_id': message['message_id'],
-                    'file_name': file_name
-                }
-            else:
-                error = result.get('description', 'Upload failed')
-                friendly_error = self._translate_error(error)
-                
-                # Handle rate limiting
-                if 'retry after' in error.lower():
-                    retry_after = result.get('parameters', {}).get('retry_after', 30)
+                if result.get('ok'):
+                    message = result['result']
+                    doc = message.get('document', {})
+                    
+                    # Get file_id
+                    file_id = doc.get('file_id')
+                    if not file_id:
+                        # Try other media types
+                        for media_type in ['video', 'audio', 'photo', 'animation']:
+                            media = message.get(media_type)
+                            if media:
+                                if isinstance(media, list):
+                                    file_id = media[-1].get('file_id')
+                                else:
+                                    file_id = media.get('file_id')
+                                break
+                    
                     return {
-                        'success': False,
-                        'error': f'Rate limited. Retry after {retry_after}s',
-                        'retry_after': retry_after
+                        'success': True,
+                        'file_id': file_id,
+                        'message_id': message['message_id'],
+                        'file_name': file_name
                     }
+                else:
+                    error = result.get('description', 'Upload failed')
+                    friendly_error = self._translate_error(error)
+                    
+                    # Handle rate limiting with retry
+                    if 'retry after' in error.lower():
+                        retry_after = result.get('parameters', {}).get('retry_after', 30)
+                        
+                        if attempt < max_retries - 1:
+                            logger.warning(f"Rate limited, waiting {retry_after}s before retry {attempt + 1}/{max_retries}")
+                            time.sleep(retry_after)
+                            continue
+                        
+                        return {
+                            'success': False,
+                            'error': f'Rate limited. Retry after {retry_after}s',
+                            'retry_after': retry_after
+                        }
+                    
+                    # Retry on temporary errors
+                    if attempt < max_retries - 1 and any(err in error.lower() for err in ['timeout', 'network', 'temporary']):
+                        wait_time = (2 ** attempt) * 5  # Exponential backoff: 5s, 10s, 20s
+                        logger.warning(f"Upload failed, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                        continue
+                    
+                    return {'success': False, 'error': friendly_error}
+                    
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 5
+                    logger.warning(f"Upload timed out, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
                 
-                return {'success': False, 'error': friendly_error}
+                return {'success': False, 'error': 'Upload timed out. File may be too large or connection slow.'}
                 
-        except requests.exceptions.Timeout:
-            return {'success': False, 'error': 'Upload timed out. File may be too large or connection slow.'}
-        except requests.exceptions.RequestException as e:
-            return {'success': False, 'error': f'Network error: {str(e)}'}
-        except Exception as e:
-            return {'success': False, 'error': f'Error: {str(e)}'}
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 5
+                    self._log_error(f"Upload request failed, retrying in {wait_time}s", e)
+                    time.sleep(wait_time)
+                    continue
+                
+                self._log_error("Upload request failed after all retries", e)
+                return {'success': False, 'error': 'Network error. Please check your internet connection.'}
+                
+            except Exception as e:
+                self._log_error("Unexpected error during upload", e)
+                return {'success': False, 'error': f'Unexpected error: {type(e).__name__}'}
+        
+        return {'success': False, 'error': 'Upload failed after all retries'}
     
     def delete_message(self, channel_id: str, message_id: int) -> bool:
         """Delete a message from the channel."""
@@ -249,7 +319,8 @@ class TelegramAPI:
                 timeout=10
             )
             return resp.json().get('ok', False)
-        except:
+        except Exception as e:
+            self._log_error(f"Failed to delete message {message_id}", e)
             return False
     
     def get_bot_username(self) -> Optional[str]:
