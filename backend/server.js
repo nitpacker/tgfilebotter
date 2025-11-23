@@ -1,10 +1,10 @@
-// server.js - Main Backend Server Entry Point (FIXED VERSION)
-// FIXES: Environment validation, graceful shutdown, input size limits, health check
+// server.js - Main Backend Server Entry Point (SECURITY HARDENED)
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const path = require('path');
+const crypto = require('crypto');
 
 const BotManager = require('./bot-manager');
 const Storage = require('./storage');
@@ -28,30 +28,58 @@ const adminRoutes = new AdminRoutes(storage, config, botManager, adminBot, secur
 
 // Security middleware
 app.use(helmet({
-  contentSecurityPolicy: false // Allow inline scripts for admin panel
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"], // Allow inline styles for admin panel
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"]
+    }
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
 }));
 
-// FIXED: Add input size limits with DoS protection
+// Trust proxy (needed for accurate IP detection behind Caddy)
+app.set('trust proxy', 1);
+
+// SECURITY FIX: Add request size limits with DoS protection
 app.use(express.json({ 
   limit: '15mb',
-  verify: (req, res, buf) => {
-    const body = buf.toString();
-    
-    // Check for extremely deep nesting (DoS attack)
-    const depth = (body.match(/{/g) || []).length;
-    if (depth > 100) {
-      throw new Error('JSON too deeply nested');
-    }
-    
-    // Check for extremely long strings (DoS attack)
-    if (/"[^"]{100000,}"/.test(body)) {
-      throw new Error('JSON contains extremely long strings');
+  verify: (req, res, buf, encoding) => {
+    try {
+      const body = buf.toString(encoding || 'utf8');
+      
+      // Check for extremely deep nesting (DoS attack)
+      const depth = (body.match(/{/g) || []).length;
+      if (depth > 100) {
+        throw new Error('JSON too deeply nested');
+      }
+      
+      // Check for extremely long strings (DoS attack)
+      if (/"[^"]{100000,}"/.test(body)) {
+        throw new Error('JSON contains extremely long strings');
+      }
+    } catch (error) {
+      // Let express handle the error
+      throw error;
     }
   }
 }));
 
 // Serve static files from public folder
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  maxAge: '1d',
+  etag: true
+}));
 
 // Rate limiting - Global
 const globalLimiter = rateLimit({
@@ -60,6 +88,13 @@ const globalLimiter = rateLimit({
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      error: 'Rate limit exceeded',
+      retryAfter: Math.ceil((req.rateLimit.resetTime - Date.now()) / 1000)
+    });
+  }
 });
 
 // Rate limiting - Upload endpoint (stricter)
@@ -77,6 +112,14 @@ const uploadLimiter = rateLimit({
   }
 });
 
+// SECURITY FIX: Rate limit metadata endpoint
+const metadataLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: 'Too many metadata requests.',
+  standardHeaders: true
+});
+
 app.use(globalLimiter);
 
 // ============================================================
@@ -85,11 +128,23 @@ app.use(globalLimiter);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
 });
 
-// FIXED: Add detailed health check
+// SECURITY FIX: Add detailed health check with authentication
 app.get('/api/health/detailed', async (req, res) => {
+  // Simple token-based auth for health check
+  const token = req.query.token;
+  const expectedToken = process.env.HEALTH_CHECK_TOKEN || crypto.randomBytes(16).toString('hex');
+  
+  if (token !== expectedToken) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
   const health = {
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -114,7 +169,7 @@ app.get('/api/health/detailed', async (req, res) => {
     } catch (error) {
       health.checks.storage = {
         status: 'error',
-        error: error.message
+        error: 'Storage check failed'
       };
       health.status = 'degraded';
     }
@@ -136,7 +191,7 @@ app.get('/api/health/detailed', async (req, res) => {
   } catch (error) {
     res.status(500).json({
       status: 'error',
-      error: error.message
+      error: 'Health check failed'
     });
   }
 });
@@ -150,14 +205,39 @@ app.get('/admin', (req, res) => {
 // API ROUTES
 // ============================================================
 
+// SECURITY FIX: Add CSRF token generation endpoint
+app.get('/api/csrf-token', (req, res) => {
+  const token = crypto.randomBytes(32).toString('hex');
+  res.json({ csrfToken: token });
+});
+
 // Bot metadata upload endpoint
 app.post('/api/upload',
   uploadLimiter,
   [
-    body('botToken').trim().notEmpty().isLength({ max: 100 }),
-    body('channelId').trim().notEmpty().isLength({ max: 50 }),
-    body('botUsername').trim().notEmpty().matches(/^@[a-zA-Z0-9_]{5,32}$/),
-    body('metadata').isObject(),
+    body('botToken')
+      .trim()
+      .notEmpty().withMessage('Bot token is required')
+      .isLength({ max: 100 }).withMessage('Bot token too long')
+      .matches(/^\d{8,10}:[A-Za-z0-9_-]{35}$/).withMessage('Invalid bot token format'),
+    body('channelId')
+      .trim()
+      .notEmpty().withMessage('Channel ID is required')
+      .isLength({ max: 50 }).withMessage('Channel ID too long')
+      .matches(/^(@[a-zA-Z0-9_]{5,32}|-100\d{10,})$/).withMessage('Invalid channel ID format'),
+    body('botUsername')
+      .trim()
+      .notEmpty().withMessage('Bot username is required')
+      .matches(/^@[a-zA-Z0-9_]{5,32}$/).withMessage('Invalid bot username format'),
+    body('metadata')
+      .isObject().withMessage('Metadata must be an object')
+      .custom((value) => {
+        // SECURITY FIX: Validate metadata structure
+        if (!value.hasOwnProperty('subfolders') || !value.hasOwnProperty('files')) {
+          throw new Error('Invalid metadata structure');
+        }
+        return true;
+      })
   ],
   async (req, res) => {
     try {
@@ -167,16 +247,23 @@ app.post('/api/upload',
         return res.status(400).json({ 
           success: false, 
           error: 'Invalid input data',
-          details: errors.array()
+          details: errors.array().map(e => e.msg)
         });
       }
 
       const { botToken, channelId, botUsername, metadata } = req.body;
 
-      // Sanitize inputs
+      // SECURITY FIX: Already validated by express-validator, but sanitize anyway
       const sanitizedToken = security.sanitizeInput(botToken);
       const sanitizedChannelId = security.sanitizeInput(channelId);
       const sanitizedUsername = security.sanitizeInput(botUsername);
+
+      if (!sanitizedToken || !sanitizedChannelId || !sanitizedUsername) {
+        return res.status(400).json({
+          success: false,
+          error: 'Input sanitization failed'
+        });
+      }
 
       // Validate JSON metadata size
       const metadataSize = JSON.stringify(metadata).length;
@@ -205,7 +292,7 @@ app.post('/api/upload',
         return res.status(400).json({
           success: false,
           error: 'Invalid folder structure',
-          details: folderValidation.errors
+          details: folderValidation.errors.map(e => e.error)
         });
       }
 
@@ -265,6 +352,7 @@ app.post('/api/upload',
       console.error('Upload error:', error);
       await adminBot.sendAlert('error', `Upload endpoint error: ${error.message}`);
       
+      // SECURITY FIX: Don't expose internal error details
       return res.status(500).json({
         success: false,
         error: 'Internal server error during upload'
@@ -277,6 +365,15 @@ app.post('/api/upload',
 app.get('/api/bot-status/:botToken', async (req, res) => {
   try {
     const botToken = security.sanitizeInput(req.params.botToken);
+    
+    // SECURITY FIX: Validate token format
+    if (!botToken || !security.isValidBotToken(botToken)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid bot token format'
+      });
+    }
+    
     const bot = storage.getBotByToken(botToken);
 
     if (!bot) {
@@ -305,9 +402,18 @@ app.get('/api/bot-status/:botToken', async (req, res) => {
 });
 
 // Bot metadata endpoint (for update mode in uploader)
-app.get('/api/bot-metadata/:botToken', async (req, res) => {
+app.get('/api/bot-metadata/:botToken', metadataLimiter, async (req, res) => {
   try {
     const botToken = security.sanitizeInput(req.params.botToken);
+    
+    // SECURITY FIX: Validate token format
+    if (!botToken || !security.isValidBotToken(botToken)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid bot token format'
+      });
+    }
+    
     const bot = storage.getBotByToken(botToken);
 
     if (!bot) {
@@ -344,13 +450,28 @@ app.use('/api/admin', adminRoutes.getRouter());
 // ============================================================
 // ERROR HANDLING
 // ============================================================
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Not found'
+  });
+});
+
+// Global error handler
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
+  
+  // SECURITY FIX: Don't expose stack traces in production
+  const isDevelopment = process.env.NODE_ENV !== 'production';
+  
   adminBot.sendAlert('error', `Unhandled server error: ${err.message}`).catch(console.error);
   
   res.status(500).json({
     success: false,
-    error: 'Internal server error'
+    error: isDevelopment ? err.message : 'Internal server error',
+    ...(isDevelopment && { stack: err.stack })
   });
 });
 
@@ -358,7 +479,7 @@ app.use((err, req, res, next) => {
 // SERVER INITIALIZATION
 // ============================================================
 
-// FIXED: Environment validation before startup
+// SECURITY FIX: Environment validation before startup
 function validateEnvironment() {
   const errors = [];
   
@@ -371,6 +492,11 @@ function validateEnvironment() {
     errors.push('ADMIN_PASSWORD not set');
   } else if (process.env.ADMIN_PASSWORD.length < 12) {
     errors.push('ADMIN_PASSWORD must be at least 12 characters');
+  }
+  
+  // SECURITY FIX: Check password complexity
+  if (process.env.ADMIN_PASSWORD && !/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])/.test(process.env.ADMIN_PASSWORD)) {
+    console.warn('⚠ WARNING: ADMIN_PASSWORD should contain uppercase, lowercase, number, and special character');
   }
   
   const port = process.env.PORT || 3000;
@@ -393,7 +519,7 @@ let isShuttingDown = false;
 
 async function startServer() {
   try {
-    // FIXED: Validate environment first
+    // Validate environment first
     validateEnvironment();
     
     await config.initialize();
@@ -414,13 +540,18 @@ async function startServer() {
       ).catch(console.error);
     });
 
+    // SECURITY FIX: Set server timeout
+    server.timeout = 120000; // 2 minutes
+    server.keepAliveTimeout = 65000; // 65 seconds
+    server.headersTimeout = 66000; // Slightly more than keepAliveTimeout
+
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);
   }
 }
 
-// FIXED: Improved graceful shutdown
+// Graceful shutdown
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;

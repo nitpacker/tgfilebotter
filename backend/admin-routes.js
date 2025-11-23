@@ -1,5 +1,4 @@
-// admin-routes.js - Admin Panel API Routes (FIXED VERSION)
-// FIXES: Session persistence, input validation, missing approve endpoint, operation backups
+// admin-routes.js - Admin Panel API Routes (SECURITY HARDENED)
 const express = require('express');
 const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
@@ -18,9 +17,10 @@ class AdminRoutes {
     // Session storage with persistence
     this.sessions = new Map();
     this.failedLogins = new Map();
+    this.csrfTokens = new Map(); // SECURITY FIX: CSRF protection
     this.sessionFile = path.join(__dirname, '..', 'data', 'config', 'sessions.json');
     
-    // Admin credentials (should be from environment)
+    // Admin credentials (from environment)
     this.adminCredentials = {
       username: process.env.ADMIN_USERNAME || 'admin',
       password: this.hashPassword(process.env.ADMIN_PASSWORD || 'admin123')
@@ -28,6 +28,9 @@ class AdminRoutes {
     
     // Load existing sessions on startup
     this.loadSessions().catch(err => console.error('Failed to load sessions:', err));
+    
+    // SECURITY FIX: Cleanup old failed login attempts every 15 minutes
+    setInterval(() => this.cleanupFailedLogins(), 15 * 60 * 1000);
     
     this.setupRoutes();
   }
@@ -45,6 +48,9 @@ class AdminRoutes {
         }
       }
       console.log(`✓ Restored ${this.sessions.size} active admin sessions`);
+      
+      // SECURITY FIX: Ensure file has correct permissions
+      await fs.chmod(this.sessionFile, 0o600);
     } catch (error) {
       if (error.code !== 'ENOENT') {
         console.error('Error loading sessions:', error);
@@ -59,17 +65,67 @@ class AdminRoutes {
         sessions[token] = session;
       }
       await fs.writeFile(this.sessionFile, JSON.stringify(sessions, null, 2));
+      
+      // SECURITY FIX: Set restrictive permissions
+      await fs.chmod(this.sessionFile, 0o600);
     } catch (error) {
       console.error('Error saving sessions:', error);
     }
   }
 
   hashPassword(password) {
-    return crypto.createHash('sha256').update(password).digest('hex');
+    // SECURITY FIX: Use more secure hashing with salt
+    const salt = process.env.PASSWORD_SALT || 'default-salt-change-me';
+    return crypto.createHash('sha256').update(password + salt).digest('hex');
   }
 
   generateToken() {
     return crypto.randomBytes(32).toString('hex');
+  }
+
+  // SECURITY FIX: Generate and validate CSRF tokens
+  generateCSRFToken(sessionToken) {
+    const csrfToken = crypto.randomBytes(32).toString('hex');
+    this.csrfTokens.set(csrfToken, {
+      sessionToken,
+      expires: Date.now() + 3600000 // 1 hour
+    });
+    return csrfToken;
+  }
+
+  validateCSRFToken(csrfToken, sessionToken) {
+    const tokenData = this.csrfTokens.get(csrfToken);
+    if (!tokenData) return false;
+    if (tokenData.expires < Date.now()) {
+      this.csrfTokens.delete(csrfToken);
+      return false;
+    }
+    if (tokenData.sessionToken !== sessionToken) return false;
+    return true;
+  }
+
+  // SECURITY FIX: Cleanup expired CSRF tokens
+  cleanupCSRFTokens() {
+    const now = Date.now();
+    for (const [token, data] of this.csrfTokens.entries()) {
+      if (data.expires < now) {
+        this.csrfTokens.delete(token);
+      }
+    }
+  }
+
+  // SECURITY FIX: Cleanup old failed login attempts
+  cleanupFailedLogins() {
+    const now = Date.now();
+    for (const [ip, attempts] of this.failedLogins.entries()) {
+      if (attempts.blockedUntil < now && attempts.count === 0) {
+        this.failedLogins.delete(ip);
+      } else if (attempts.blockedUntil < now) {
+        // Reset count after block expires
+        attempts.count = 0;
+        attempts.blockedUntil = 0;
+      }
+    }
   }
 
   // Middleware: Check authentication
@@ -85,14 +141,30 @@ class AdminRoutes {
     
     if (!session || Date.now() > session.expires) {
       this.sessions.delete(token);
-      this.saveSessions(); // Persist deletion
+      this.saveSessions();
       return res.status(401).json({ success: false, error: 'Session expired' });
     }
     
     // Extend session
     session.expires = Date.now() + 30 * 60 * 1000; // 30 minutes
-    this.saveSessions(); // Persist extension
+    session.lastActivity = Date.now();
+    this.saveSessions();
     req.adminSession = session;
+    next();
+  }
+
+  // SECURITY FIX: CSRF validation middleware
+  validateCSRF(req, res, next) {
+    const csrfToken = req.headers['x-csrf-token'] || req.body.csrfToken;
+    const sessionToken = req.headers.authorization?.substring(7);
+    
+    if (!csrfToken || !this.validateCSRFToken(csrfToken, sessionToken)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Invalid CSRF token'
+      });
+    }
+    
     next();
   }
 
@@ -114,84 +186,111 @@ class AdminRoutes {
 
   setupRoutes() {
     const auth = this.authenticate.bind(this);
+    const csrf = this.validateCSRF.bind(this);
     
+    // SECURITY FIX: Get CSRF token endpoint
+    this.router.get('/csrf-token', auth, (req, res) => {
+      const sessionToken = req.headers.authorization.substring(7);
+      const csrfToken = this.generateCSRFToken(sessionToken);
+      res.json({ success: true, csrfToken });
+    });
+
     // Login
-    this.router.post('/login', this.checkLoginAttempts.bind(this), async (req, res) => {
-      try {
-        const { username, password } = req.body;
-        const ip = req.ip;
-        
-        // FIXED: Input validation
-        if (!username || typeof username !== 'string' || username.length > 100) {
-          return res.status(400).json({ success: false, error: 'Invalid username' });
-        }
-        
-        if (!password || typeof password !== 'string' || password.length > 1000) {
-          return res.status(400).json({ success: false, error: 'Invalid password' });
-        }
-        
-        // Sanitize username (but not password - may contain special chars)
-        const cleanUsername = this.security.sanitizeInput(username);
-        if (!cleanUsername) {
-          return res.status(400).json({ success: false, error: 'Invalid username format' });
-        }
-        
-        const hashedPassword = this.hashPassword(password);
-        
-        if (cleanUsername === this.adminCredentials.username && 
-            hashedPassword === this.adminCredentials.password) {
+    this.router.post('/login', 
+      this.checkLoginAttempts.bind(this),
+      [
+        body('username').trim().isLength({ min: 1, max: 100 }).withMessage('Invalid username'),
+        body('password').isLength({ min: 1, max: 1000 }).withMessage('Invalid password')
+      ],
+      async (req, res) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid input'
+            });
+          }
+
+          const { username, password } = req.body;
+          const ip = req.ip;
           
-          // Clear failed attempts
-          this.failedLogins.delete(ip);
-          
-          // Create session
-          const token = this.generateToken();
-          const session = {
-            token,
-            username: cleanUsername,
-            created: Date.now(),
-            expires: Date.now() + 30 * 60 * 1000 // 30 minutes
-          };
-          
-          this.sessions.set(token, session);
-          await this.saveSessions(); // FIXED: Persist to disk
-          
-          await this.adminBot.sendAlert('system', `Admin logged in from IP: ${ip}`);
-          
-          return res.json({ success: true, token });
-          
-        } else {
-          // Track failed attempt
-          const attempts = this.failedLogins.get(ip) || { count: 0, blockedUntil: 0 };
-          attempts.count++;
-          
-          if (attempts.count >= 5) {
-            attempts.blockedUntil = Date.now() + 15 * 60 * 1000; // 15 minutes
-            await this.adminBot.sendSecurityAlert('HIGH', 'Login Attack', 
-              `Multiple failed login attempts from IP: ${ip}`);
+          // Sanitize username
+          const cleanUsername = this.security.sanitizeInput(username);
+          if (!cleanUsername) {
+            return res.status(400).json({ success: false, error: 'Invalid username format' });
           }
           
-          this.failedLogins.set(ip, attempts);
+          const hashedPassword = this.hashPassword(password);
           
-          return res.status(401).json({ success: false, error: 'Invalid credentials' });
+          if (cleanUsername === this.adminCredentials.username && 
+              hashedPassword === this.adminCredentials.password) {
+            
+            // Clear failed attempts
+            this.failedLogins.delete(ip);
+            
+            // Create session
+            const token = this.generateToken();
+            const session = {
+              token,
+              username: cleanUsername,
+              created: Date.now(),
+              expires: Date.now() + 30 * 60 * 1000, // 30 minutes
+              lastActivity: Date.now(),
+              ip: ip // SECURITY FIX: Track IP for session hijacking detection
+            };
+            
+            this.sessions.set(token, session);
+            await this.saveSessions();
+            
+            await this.adminBot.sendAlert('system', `Admin logged in from IP: ${ip}`);
+            
+            // Generate initial CSRF token
+            const csrfToken = this.generateCSRFToken(token);
+            
+            return res.json({ success: true, token, csrfToken });
+            
+          } else {
+            // Track failed attempt
+            const attempts = this.failedLogins.get(ip) || { count: 0, blockedUntil: 0 };
+            attempts.count++;
+            
+            if (attempts.count >= 5) {
+              attempts.blockedUntil = Date.now() + 15 * 60 * 1000; // 15 minutes
+              await this.adminBot.sendSecurityAlert('HIGH', 'Login Attack', 
+                `Multiple failed login attempts from IP: ${ip}`);
+            }
+            
+            this.failedLogins.set(ip, attempts);
+            
+            // SECURITY FIX: Generic error message
+            return res.status(401).json({ success: false, error: 'Invalid credentials' });
+          }
+          
+        } catch (error) {
+          console.error('Login error:', error);
+          return res.status(500).json({ success: false, error: 'Login failed' });
         }
-        
-      } catch (error) {
-        console.error('Login error:', error);
-        return res.status(500).json({ success: false, error: 'Login failed' });
-      }
-    });
+      });
 
     // Verify session
     this.router.get('/verify', auth, (req, res) => {
       res.json({ success: true });
     });
 
-    // Logout endpoint (clear session)
+    // Logout endpoint
     this.router.post('/logout', auth, async (req, res) => {
       try {
         const token = req.headers.authorization.substring(7);
         this.sessions.delete(token);
+        
+        // SECURITY FIX: Cleanup associated CSRF tokens
+        for (const [csrfToken, data] of this.csrfTokens.entries()) {
+          if (data.sessionToken === token) {
+            this.csrfTokens.delete(csrfToken);
+          }
+        }
+        
         await this.saveSessions();
         res.json({ success: true, message: 'Logged out successfully' });
       } catch (error) {
@@ -251,7 +350,13 @@ class AdminRoutes {
           bots = bots.filter(b => b.status === status);
         }
         
-        res.json({ success: true, bots });
+        // SECURITY FIX: Don't expose bot tokens
+        const safeBots = bots.map(bot => ({
+          ...bot,
+          botToken: '••••••' + (bot.botToken ? bot.botToken.slice(-4) : '')
+        }));
+        
+        res.json({ success: true, bots: safeBots });
         
       } catch (error) {
         console.error('Get bots error:', error);
@@ -262,13 +367,20 @@ class AdminRoutes {
     // Get single bot
     this.router.get('/bot/:botId', auth, async (req, res) => {
       try {
-        const bot = this.storage.getBotById(req.params.botId);
+        const botId = this.security.sanitizeInput(req.params.botId);
+        const bot = this.storage.getBotById(botId);
         
         if (!bot) {
           return res.status(404).json({ success: false, error: 'Bot not found' });
         }
         
-        res.json({ success: true, bot });
+        // SECURITY FIX: Mask bot token
+        const safeBot = {
+          ...bot,
+          botToken: '••••••' + (bot.botToken ? bot.botToken.slice(-4) : '')
+        };
+        
+        res.json({ success: true, bot: safeBot });
         
       } catch (error) {
         console.error('Get bot error:', error);
@@ -276,158 +388,186 @@ class AdminRoutes {
       }
     });
 
-    // FIXED: NEW - Approve bot endpoint
-    this.router.post('/approve-bot', auth, async (req, res) => {
-      try {
-        const { botId } = req.body;
-        
-        if (!botId) {
-          return res.status(400).json({ success: false, error: 'Bot ID required' });
-        }
-        
-        const bot = this.storage.getBotById(botId);
-        
-        if (!bot) {
-          return res.status(404).json({ success: false, error: 'Bot not found' });
-        }
-        
-        if (bot.status === 'approved') {
-          return res.json({ success: true, message: 'Bot already approved' });
-        }
-        
-        // Create backup of operation
-        await this.storage.createOperationBackup('approve_bot', {
-          botId,
-          botUsername: bot.botUsername,
-          previousStatus: bot.status,
-          timestamp: new Date().toISOString(),
-          approvedBy: req.adminSession.username
-        });
-        
-        // Update status to approved
-        const success = await this.storage.updateBotStatusAtomic(botId, 'approved');
-        
-        if (success) {
-          await this.adminBot.sendAlert('approval', 
-            `Bot ${bot.botUsername} has been approved!\n` +
-            `Bot ID: ${botId}\n` +
-            `Owner: ${bot.ownerId || 'Not registered'}`
-          );
+    // Approve bot endpoint
+    this.router.post('/approve-bot', auth, csrf, 
+      [body('botId').trim().notEmpty().withMessage('Bot ID required')],
+      async (req, res) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid input',
+              details: errors.array().map(e => e.msg)
+            });
+          }
+
+          const { botId } = req.body;
+          const sanitizedBotId = this.security.sanitizeInput(botId);
           
-          // Notify bot owner if registered
-          if (bot.ownerId) {
-            try {
-              await this.botManager.sendAdminMessage(
-                botId,
-                bot.ownerId,
-                '🎉 Your bot has been approved! It is now public and available to all users.'
-              );
-            } catch (error) {
-              console.error('Failed to notify bot owner:', error);
-            }
+          const bot = this.storage.getBotById(sanitizedBotId);
+          
+          if (!bot) {
+            return res.status(404).json({ success: false, error: 'Bot not found' });
           }
           
-          return res.json({ 
-            success: true,
-            message: 'Bot approved successfully'
+          if (bot.status === 'approved') {
+            return res.json({ success: true, message: 'Bot already approved' });
+          }
+          
+          // Create backup of operation
+          await this.storage.createOperationBackup('approve_bot', {
+            botId: sanitizedBotId,
+            botUsername: bot.botUsername,
+            previousStatus: bot.status,
+            timestamp: new Date().toISOString(),
+            approvedBy: req.adminSession.username
           });
-        } else {
-          return res.status(500).json({ 
-            success: false, 
-            error: 'Failed to update bot status' 
-          });
+          
+          const success = await this.storage.updateBotStatusAtomic(sanitizedBotId, 'approved');
+          
+          if (success) {
+            await this.adminBot.sendAlert('approval', 
+              `Bot ${bot.botUsername} has been approved!\nBot ID: ${sanitizedBotId}\nOwner: ${bot.ownerId || 'Not registered'}`
+            );
+            
+            // Notify bot owner if registered
+            if (bot.ownerId) {
+              try {
+                await this.botManager.sendAdminMessage(
+                  sanitizedBotId,
+                  bot.ownerId,
+                  '🎉 Your bot has been approved! It is now public and available to all users.'
+                );
+              } catch (error) {
+                console.error('Failed to notify bot owner:', error);
+              }
+            }
+            
+            return res.json({ 
+              success: true,
+              message: 'Bot approved successfully'
+            });
+          } else {
+            return res.status(500).json({ 
+              success: false, 
+              error: 'Failed to update bot status' 
+            });
+          }
+          
+        } catch (error) {
+          console.error('Approve bot error:', error);
+          res.status(500).json({ success: false, error: 'Failed to approve bot' });
         }
-        
-      } catch (error) {
-        console.error('Approve bot error:', error);
-        res.status(500).json({ success: false, error: 'Failed to approve bot' });
-      }
-    });
+      });
 
     // Disconnect bot
-    this.router.post('/disconnect-bot', auth, async (req, res) => {
-      try {
-        const { botId } = req.body;
-        
-        if (!botId) {
-          return res.status(400).json({ success: false, error: 'Bot ID required' });
+    this.router.post('/disconnect-bot', auth, csrf,
+      [body('botId').trim().notEmpty().withMessage('Bot ID required')],
+      async (req, res) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid input'
+            });
+          }
+
+          const { botId } = req.body;
+          const sanitizedBotId = this.security.sanitizeInput(botId);
+          
+          const bot = this.storage.getBotById(sanitizedBotId);
+          
+          if (!bot) {
+            return res.status(404).json({ success: false, error: 'Bot not found' });
+          }
+          
+          await this.storage.createOperationBackup('disconnect_bot', {
+            botId: sanitizedBotId,
+            botUsername: bot.botUsername,
+            previousStatus: bot.status,
+            timestamp: new Date().toISOString(),
+            disconnectedBy: req.adminSession.username
+          });
+          
+          const success = await this.storage.updateBotStatusAtomic(sanitizedBotId, 'disconnected');
+          
+          if (success) {
+            await this.botManager.stopBot(sanitizedBotId);
+            await this.adminBot.sendAlert('moderation', `Bot ${sanitizedBotId} has been disconnected`);
+            return res.json({ success: true });
+          } else {
+            return res.status(404).json({ success: false, error: 'Bot not found' });
+          }
+          
+        } catch (error) {
+          console.error('Disconnect bot error:', error);
+          res.status(500).json({ success: false, error: 'Failed to disconnect bot' });
         }
-        
-        const bot = this.storage.getBotById(botId);
-        
-        if (!bot) {
-          return res.status(404).json({ success: false, error: 'Bot not found' });
-        }
-        
-        // Create backup of operation
-        await this.storage.createOperationBackup('disconnect_bot', {
-          botId,
-          botUsername: bot.botUsername,
-          previousStatus: bot.status,
-          timestamp: new Date().toISOString(),
-          disconnectedBy: req.adminSession.username
-        });
-        
-        const success = await this.storage.updateBotStatusAtomic(botId, 'disconnected');
-        
-        if (success) {
-          await this.adminBot.sendAlert('moderation', `Bot ${botId} has been disconnected`);
-          return res.json({ success: true });
-        } else {
-          return res.status(404).json({ success: false, error: 'Bot not found' });
-        }
-        
-      } catch (error) {
-        console.error('Disconnect bot error:', error);
-        res.status(500).json({ success: false, error: 'Failed to disconnect bot' });
-      }
-    });
+      });
 
     // Ban user
-    this.router.post('/ban-user', auth, async (req, res) => {
-      try {
-        const { userId, reason } = req.body;
-        
-        if (!userId) {
-          return res.status(400).json({ success: false, error: 'User ID required' });
+    this.router.post('/ban-user', auth, csrf,
+      [
+        body('userId').trim().notEmpty().withMessage('User ID required'),
+        body('reason').optional().trim().isLength({ max: 500 }).withMessage('Reason too long')
+      ],
+      async (req, res) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid input'
+            });
+          }
+
+          const { userId, reason } = req.body;
+          const sanitizedUserId = this.security.sanitizeInput(userId);
+          const sanitizedReason = this.security.sanitizeInput(reason || 'No reason provided');
+          
+          // SECURITY FIX: Validate userId is a number
+          if (!/^\d+$/.test(sanitizedUserId)) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid user ID format' 
+            });
+          }
+          
+          const userBots = this.storage.getBotsByOwner(sanitizedUserId);
+          
+          await this.storage.createOperationBackup('ban_user', {
+            userId: sanitizedUserId,
+            reason: sanitizedReason,
+            timestamp: new Date().toISOString(),
+            bannedBy: req.adminSession.username,
+            botsAffected: userBots.map(b => ({
+              id: b.id,
+              botUsername: b.botUsername,
+              status: b.status
+            }))
+          });
+          
+          await this.storage.addBannedUser(sanitizedUserId, sanitizedReason);
+          
+          // Disconnect all bots owned by this user
+          for (const bot of userBots) {
+            await this.storage.updateBotStatusAtomic(bot.id, 'disconnected');
+            await this.botManager.stopBot(bot.id);
+          }
+          
+          await this.adminBot.sendAlert('ban', 
+            `User ${sanitizedUserId} banned. ${userBots.length} bot(s) disconnected.\nReason: ${sanitizedReason}`
+          );
+          
+          res.json({ success: true, botsDisconnected: userBots.length });
+          
+        } catch (error) {
+          console.error('Ban user error:', error);
+          res.status(500).json({ success: false, error: 'Failed to ban user' });
         }
-        
-        // Get user's bots before banning (for backup)
-        const userBots = this.storage.getBotsByOwner(userId);
-        
-        // FIXED: Create backup of operation
-        await this.storage.createOperationBackup('ban_user', {
-          userId,
-          reason: reason || 'No reason provided',
-          timestamp: new Date().toISOString(),
-          bannedBy: req.adminSession.username,
-          botsAffected: userBots.map(b => ({
-            id: b.id,
-            botUsername: b.botUsername,
-            status: b.status
-          }))
-        });
-        
-        // Add to banned list
-        await this.storage.addBannedUser(userId, reason || 'No reason provided');
-        
-        // Disconnect all bots owned by this user
-        for (const bot of userBots) {
-          await this.storage.updateBotStatusAtomic(bot.id, 'disconnected');
-          await this.botManager.stopBot(bot.id);
-        }
-        
-        await this.adminBot.sendAlert('ban', 
-          `User ${userId} banned. ${userBots.length} bot(s) disconnected.\nReason: ${reason}`
-        );
-        
-        res.json({ success: true, botsDisconnected: userBots.length });
-        
-      } catch (error) {
-        console.error('Ban user error:', error);
-        res.status(500).json({ success: false, error: 'Failed to ban user' });
-      }
-    });
+      });
 
     // Get banned users
     this.router.get('/banned-users', auth, async (req, res) => {
@@ -441,76 +581,97 @@ class AdminRoutes {
     });
 
     // Unban user
-    this.router.post('/unban-user', auth, async (req, res) => {
-      try {
-        const { userId } = req.body;
-        
-        if (!userId) {
-          return res.status(400).json({ success: false, error: 'User ID required' });
+    this.router.post('/unban-user', auth, csrf,
+      [body('userId').trim().notEmpty().withMessage('User ID required')],
+      async (req, res) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid input'
+            });
+          }
+
+          const { userId } = req.body;
+          const sanitizedUserId = this.security.sanitizeInput(userId);
+          
+          if (!/^\d+$/.test(sanitizedUserId)) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid user ID format' 
+            });
+          }
+          
+          await this.storage.createOperationBackup('unban_user', {
+            userId: sanitizedUserId,
+            timestamp: new Date().toISOString(),
+            unbannedBy: req.adminSession.username
+          });
+          
+          const config = await this.storage.loadConfig('banned_users') || { users: [] };
+          config.users = config.users.filter(u => u.userId !== sanitizedUserId);
+          await this.storage.saveConfig('banned_users', config);
+          
+          await this.adminBot.sendAlert('moderation', `User ${sanitizedUserId} has been unbanned`);
+          
+          res.json({ success: true });
+          
+        } catch (error) {
+          console.error('Unban user error:', error);
+          res.status(500).json({ success: false, error: 'Failed to unban user' });
         }
-        
-        // Create backup of operation
-        await this.storage.createOperationBackup('unban_user', {
-          userId,
-          timestamp: new Date().toISOString(),
-          unbannedBy: req.adminSession.username
-        });
-        
-        // Remove from banned list
-        const config = await this.storage.loadConfig('banned_users') || { users: [] };
-        config.users = config.users.filter(u => u.userId !== userId);
-        await this.storage.saveConfig('banned_users', config);
-        
-        await this.adminBot.sendAlert('moderation', `User ${userId} has been unbanned`);
-        
-        res.json({ success: true });
-        
-      } catch (error) {
-        console.error('Unban user error:', error);
-        res.status(500).json({ success: false, error: 'Failed to unban user' });
-      }
-    });
+      });
 
     // Send message to bot owner
-    this.router.post('/send-message', auth, async (req, res) => {
-      try {
-        const { botId, message } = req.body;
-        
-        if (!botId || !message) {
-          return res.status(400).json({ success: false, error: 'Bot ID and message required' });
+    this.router.post('/send-message', auth, csrf,
+      [
+        body('botId').trim().notEmpty().withMessage('Bot ID required'),
+        body('message').trim().notEmpty().isLength({ max: 4000 }).withMessage('Message too long')
+      ],
+      async (req, res) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid input'
+            });
+          }
+
+          const { botId, message } = req.body;
+          const sanitizedBotId = this.security.sanitizeInput(botId);
+          const sanitizedMessage = this.security.sanitizeInput(message);
+          
+          if (!sanitizedMessage) {
+            return res.status(400).json({ success: false, error: 'Invalid message content' });
+          }
+          
+          const bot = this.storage.getBotById(sanitizedBotId);
+          
+          if (!bot || !bot.ownerId) {
+            return res.status(404).json({ success: false, error: 'Bot or owner not found' });
+          }
+          
+          await this.botManager.sendAdminMessage(sanitizedBotId, bot.ownerId, sanitizedMessage);
+          
+          res.json({ success: true });
+          
+        } catch (error) {
+          console.error('Send message error:', error);
+          res.status(500).json({ success: false, error: 'Failed to send message' });
         }
-        
-        const bot = this.storage.getBotById(botId);
-        
-        if (!bot || !bot.ownerId) {
-          return res.status(404).json({ success: false, error: 'Bot or owner not found' });
-        }
-        
-        // Sanitize message
-        const sanitizedMessage = this.security.sanitizeInput(message);
-        if (!sanitizedMessage) {
-          return res.status(400).json({ success: false, error: 'Invalid message content' });
-        }
-        
-        await this.botManager.sendAdminMessage(botId, bot.ownerId, sanitizedMessage);
-        
-        res.json({ success: true });
-        
-      } catch (error) {
-        console.error('Send message error:', error);
-        res.status(500).json({ success: false, error: 'Failed to send message' });
-      }
-    });
+      });
 
     // Get admin config
     this.router.get('/config/admin', auth, async (req, res) => {
       try {
         const config = await this.storage.loadConfig('admin') || {};
         
-        // Don't send sensitive tokens to client
+        // SECURITY FIX: Don't send sensitive tokens to client
         const safeConfig = {
           telegramUserId: config.telegramUserId || null,
-          botToken: config.botToken ? '••••••••' : null,
+          botToken: config.botToken ? '••••••' + config.botToken.slice(-4) : null,
           channelId: config.channelId || null
         };
         
@@ -523,24 +684,38 @@ class AdminRoutes {
     });
 
     // Save admin config
-    this.router.post('/config/admin', auth, async (req, res) => {
-      try {
-        const { telegramUserId, botToken, channelId } = req.body;
-        
-        await this.config.setAdminConfig(telegramUserId, botToken, channelId);
-        
-        // Reinitialize admin bot with new config
-        await this.adminBot.initialize();
-        
-        await this.adminBot.sendAlert('system', 'Admin configuration updated');
-        
-        res.json({ success: true });
-        
-      } catch (error) {
-        console.error('Save admin config error:', error);
-        res.status(500).json({ success: false, error: 'Failed to save config' });
-      }
-    });
+    this.router.post('/config/admin', auth, csrf,
+      [
+        body('telegramUserId').optional().isInt().withMessage('Invalid user ID'),
+        body('botToken').optional().trim().isLength({ max: 100 }).withMessage('Token too long'),
+        body('channelId').optional().trim().isLength({ max: 50 }).withMessage('Channel ID too long')
+      ],
+      async (req, res) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid input'
+            });
+          }
+
+          const { telegramUserId, botToken, channelId } = req.body;
+          
+          await this.config.setAdminConfig(telegramUserId, botToken, channelId);
+          
+          // Reinitialize admin bot with new config
+          await this.adminBot.initialize();
+          
+          await this.adminBot.sendAlert('system', 'Admin configuration updated');
+          
+          res.json({ success: true });
+          
+        } catch (error) {
+          console.error('Save admin config error:', error);
+          res.status(500).json({ success: false, error: 'Failed to save config' });
+        }
+      });
 
     // Get system config
     this.router.get('/config/system', auth, async (req, res) => {
@@ -554,35 +729,50 @@ class AdminRoutes {
     });
 
     // Save system config
-    this.router.post('/config/system', auth, async (req, res) => {
-      try {
-        const { maxJsonSizeMB, welcomeMessage, invalidInputMessage } = req.body;
-        
-        if (maxJsonSizeMB) {
-          await this.config.setMaxJsonSize(maxJsonSizeMB);
-        }
-        
-        if (welcomeMessage) {
-          await this.config.setWelcomeMessage(welcomeMessage);
-        }
-        
-        if (invalidInputMessage) {
-          await this.config.setInvalidInputMessage(invalidInputMessage);
-        }
-        
-        await this.adminBot.sendAlert('system', 'System configuration updated');
-        
-        res.json({ success: true });
-        
-      } catch (error) {
-        console.error('Save system config error:', error);
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
+    this.router.post('/config/system', auth, csrf,
+      [
+        body('maxJsonSizeMB').optional().isInt({ min: 1, max: 50 }).withMessage('Invalid size'),
+        body('welcomeMessage').optional().trim().isLength({ max: 500 }).withMessage('Message too long'),
+        body('invalidInputMessage').optional().trim().isLength({ max: 500 }).withMessage('Message too long')
+      ],
+      async (req, res) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+              success: false, 
+              error: 'Invalid input'
+            });
+          }
 
-    // Security log (placeholder - would come from actual logging system)
+          const { maxJsonSizeMB, welcomeMessage, invalidInputMessage } = req.body;
+          
+          if (maxJsonSizeMB) {
+            await this.config.setMaxJsonSize(maxJsonSizeMB);
+          }
+          
+          if (welcomeMessage) {
+            await this.config.setWelcomeMessage(welcomeMessage);
+          }
+          
+          if (invalidInputMessage) {
+            await this.config.setInvalidInputMessage(invalidInputMessage);
+          }
+          
+          await this.adminBot.sendAlert('system', 'System configuration updated');
+          
+          res.json({ success: true });
+          
+        } catch (error) {
+          console.error('Save system config error:', error);
+          res.status(500).json({ success: false, error: error.message });
+        }
+      });
+
+    // Security log
     this.router.get('/security-log', auth, async (req, res) => {
       try {
+        // TODO: Implement actual security log storage
         res.json({ success: true, events: [] });
       } catch (error) {
         res.json({ success: true, events: [] });
@@ -590,7 +780,7 @@ class AdminRoutes {
     });
 
     // Create backup
-    this.router.post('/create-backup', auth, async (req, res) => {
+    this.router.post('/create-backup', auth, csrf, async (req, res) => {
       try {
         const result = await this.storage.createBackup();
         
@@ -634,6 +824,35 @@ class AdminRoutes {
       } catch (error) {
         console.error('Get backups error:', error);
         res.json({ success: true, backups: [] });
+      }
+    });
+    
+    // SECURITY FIX: Cleanup endpoint for expired sessions/tokens
+    this.router.post('/cleanup', auth, csrf, async (req, res) => {
+      try {
+        const now = Date.now();
+        let cleaned = 0;
+        
+        // Cleanup expired sessions
+        for (const [token, session] of this.sessions.entries()) {
+          if (session.expires < now) {
+            this.sessions.delete(token);
+            cleaned++;
+          }
+        }
+        
+        // Cleanup expired CSRF tokens
+        this.cleanupCSRFTokens();
+        
+        // Cleanup failed login attempts
+        this.cleanupFailedLogins();
+        
+        await this.saveSessions();
+        
+        res.json({ success: true, message: `Cleaned ${cleaned} expired sessions` });
+      } catch (error) {
+        console.error('Cleanup error:', error);
+        res.status(500).json({ success: false, error: 'Cleanup failed' });
       }
     });
   }

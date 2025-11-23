@@ -1,9 +1,22 @@
-// storage.js - JSON File Storage Management (FIXED VERSION)
-// FIXES: Race conditions with atomic writes, operation backups, caching layer
+// storage.js - JSON File Storage Management (RACE CONDITION FIXES)
 const fs = require('fs');
 const fsPromises = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
+
+// SECURITY FIX: Use proper-lockfile for file locking
+// Install with: npm install proper-lockfile
+let lockfile;
+try {
+  lockfile = require('proper-lockfile');
+} catch (error) {
+  console.warn('⚠️  proper-lockfile not installed. File locking disabled. Install with: npm install proper-lockfile');
+  // Fallback to no locking
+  lockfile = {
+    lock: async () => () => {},
+    unlock: async () => {}
+  };
+}
 
 class Storage {
   constructor() {
@@ -12,12 +25,15 @@ class Storage {
     this.configDir = path.join(this.dataDir, 'config');
     this.backupsDir = path.join(this.dataDir, 'backups');
     
-    // FIXED: Add write queue for atomic operations
+    // Write queue for atomic operations
     this.writeQueue = new Map(); // botId -> Promise
     
-    // FIXED: Add caching layer
+    // Caching layer with TTL
     this.botCache = new Map(); // botId -> { data, timestamp }
     this.CACHE_TTL = 60000; // 1 minute
+    
+    // SECURITY FIX: Track ongoing operations to prevent race conditions
+    this.ongoingOperations = new Set();
     
     this.initializeDirectories();
   }
@@ -28,6 +44,13 @@ class Storage {
       await fsPromises.mkdir(this.botsDir, { recursive: true });
       await fsPromises.mkdir(this.configDir, { recursive: true });
       await fsPromises.mkdir(this.backupsDir, { recursive: true });
+      
+      // SECURITY FIX: Set restrictive permissions on data directories
+      await fsPromises.chmod(this.dataDir, 0o750);
+      await fsPromises.chmod(this.botsDir, 0o750);
+      await fsPromises.chmod(this.configDir, 0o750);
+      await fsPromises.chmod(this.backupsDir, 0o750);
+      
       console.log('✓ Storage directories initialized');
     } catch (error) {
       console.error('Error initializing directories:', error);
@@ -35,35 +58,73 @@ class Storage {
     }
   }
 
-  // FIXED: Atomic bot status update (prevents race conditions)
+  // SECURITY FIX: Atomic bot status update with file locking
   async updateBotStatusAtomic(botId, status) {
-    // Wait for any pending writes to complete
-    if (this.writeQueue.has(botId)) {
-      await this.writeQueue.get(botId);
+    const operationId = `status_${botId}_${Date.now()}`;
+    
+    // Prevent concurrent operations on same bot
+    if (this.ongoingOperations.has(botId)) {
+      console.warn(`Operation already in progress for bot ${botId}, queuing...`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      return this.updateBotStatusAtomic(botId, status);
     }
     
-    // Create new write promise
-    const writePromise = (async () => {
+    this.ongoingOperations.add(botId);
+    
+    try {
+      const filePath = path.join(this.botsDir, `bot_${botId}.json`);
+      
+      // Acquire file lock
+      let release;
       try {
-        const bot = this.getBotById(botId, false); // Don't use cache
-        if (!bot) return false;
+        release = await lockfile.lock(filePath, {
+          retries: {
+            retries: 5,
+            minTimeout: 100,
+            maxTimeout: 1000
+          }
+        });
+      } catch (error) {
+        console.error(`Failed to acquire lock for bot ${botId}:`, error);
+        this.ongoingOperations.delete(botId);
+        return false;
+      }
+      
+      try {
+        // Read current state
+        const data = await fsPromises.readFile(filePath, 'utf8');
+        const bot = JSON.parse(data);
         
+        // Update status
         bot.status = status;
         bot.statusChangedAt = new Date().toISOString();
+        bot.statusChangedBy = operationId;
         
-        await this.saveBot(bot);
-        this.clearCache(botId); // Invalidate cache
+        // Write atomically
+        const tempPath = `${filePath}.tmp`;
+        await fsPromises.writeFile(tempPath, JSON.stringify(bot, null, 2), 'utf8');
+        await fsPromises.rename(tempPath, filePath);
+        
+        // SECURITY FIX: Set restrictive permissions
+        await fsPromises.chmod(filePath, 0o640);
+        
+        // Invalidate cache
+        this.clearCache(botId);
+        
         return true;
       } finally {
-        this.writeQueue.delete(botId);
+        // Release lock
+        await release();
       }
-    })();
-    
-    this.writeQueue.set(botId, writePromise);
-    return await writePromise;
+    } catch (error) {
+      console.error(`Error updating bot status for ${botId}:`, error);
+      return false;
+    } finally {
+      this.ongoingOperations.delete(botId);
+    }
   }
 
-  // FIXED: Create operation backup before destructive actions
+  // SECURITY FIX: Create operation backup with error handling
   async createOperationBackup(operation, data) {
     try {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -80,6 +141,9 @@ class Storage {
           data
         }, null, 2)
       );
+      
+      // SECURITY FIX: Set restrictive permissions
+      await fsPromises.chmod(backupPath, 0o640);
       
       return true;
     } catch (error) {
@@ -103,23 +167,67 @@ class Storage {
     return botId;
   }
 
-  saveBotSync(bot) {
+  // SECURITY FIX: Replace synchronous save with async
+  async saveBot(bot) {
     const filePath = path.join(this.botsDir, `bot_${bot.id}.json`);
+    
+    // Acquire lock
+    let release;
     try {
-      fs.writeFileSync(filePath, JSON.stringify(bot, null, 2), 'utf8');
-      this.clearCache(bot.id); // Invalidate cache
-    } catch (err) {
-      console.error(`Error saving bot ${bot.id}:`, err);
+      release = await lockfile.lock(filePath, {
+        retries: {
+          retries: 5,
+          minTimeout: 100,
+          maxTimeout: 1000
+        }
+      });
+    } catch (error) {
+      // File doesn't exist yet, create it
+      if (error.code === 'ENOENT') {
+        await fsPromises.writeFile(filePath, JSON.stringify(bot, null, 2), 'utf8');
+        await fsPromises.chmod(filePath, 0o640);
+        this.clearCache(bot.id);
+        return;
+      }
+      throw error;
+    }
+    
+    try {
+      // Write atomically
+      const tempPath = `${filePath}.tmp`;
+      await fsPromises.writeFile(tempPath, JSON.stringify(bot, null, 2), 'utf8');
+      await fsPromises.rename(tempPath, filePath);
+      await fsPromises.chmod(filePath, 0o640);
+      this.clearCache(bot.id);
+    } finally {
+      await release();
     }
   }
 
-  async saveBot(bot) {
+  // DEPRECATED: Use saveBot() instead - kept for backward compatibility
+  saveBotSync(bot) {
     const filePath = path.join(this.botsDir, `bot_${bot.id}.json`);
-    await fsPromises.writeFile(filePath, JSON.stringify(bot, null, 2), 'utf8');
-    this.clearCache(bot.id); // Invalidate cache
+    try {
+      // SECURITY FIX: Write to temp file first, then rename (atomic operation)
+      const tempPath = `${filePath}.tmp`;
+      fs.writeFileSync(tempPath, JSON.stringify(bot, null, 2), 'utf8');
+      fs.renameSync(tempPath, filePath);
+      fs.chmodSync(filePath, 0o640);
+      this.clearCache(bot.id);
+    } catch (err) {
+      console.error(`Error saving bot ${bot.id}:`, err);
+      // Cleanup temp file if exists
+      try {
+        if (fs.existsSync(`${filePath}.tmp`)) {
+          fs.unlinkSync(`${filePath}.tmp`);
+        }
+      } catch (cleanupErr) {
+        // Ignore cleanup errors
+      }
+    }
   }
 
-  // FIXED: Added caching with proper invalidation
+  // Caching with proper invalidation
   getBotById(botId, useCache = true) {
     // Check cache first
     if (useCache) {
@@ -165,7 +273,7 @@ class Storage {
       const bots = [];
 
       for (const file of files) {
-        if (file.startsWith('bot_') && file.endsWith('.json')) {
+        if (file.startsWith('bot_') && file.endsWith('.json') && !file.endsWith('.tmp')) {
           try {
             const filePath = path.join(this.botsDir, file);
             const data = fs.readFileSync(filePath, 'utf8');
@@ -184,7 +292,7 @@ class Storage {
     }
   }
 
-  updateBot(botToken, updates) {
+  async updateBot(botToken, updates) {
     const bot = this.getBotByToken(botToken);
     if (!bot) return false;
 
@@ -194,12 +302,12 @@ class Storage {
       lastUpdate: new Date().toISOString()
     };
 
-    this.saveBotSync(updatedBot);
+    await this.saveBot(updatedBot);
     return true;
   }
 
   updateBotStatus(botId, status) {
-    const bot = this.getBotById(botId, false); // Don't use cache
+    const bot = this.getBotById(botId, false);
     if (!bot) return false;
 
     bot.status = status;
@@ -210,7 +318,7 @@ class Storage {
   }
 
   registerBotOwner(botId, ownerId) {
-    const bot = this.getBotById(botId, false); // Don't use cache
+    const bot = this.getBotById(botId, false);
     if (!bot) return false;
 
     bot.ownerId = ownerId;
@@ -224,7 +332,7 @@ class Storage {
     try {
       const filePath = path.join(this.botsDir, `bot_${botId}.json`);
       await fsPromises.unlink(filePath);
-      this.clearCache(botId); // Clear from cache
+      this.clearCache(botId);
       return true;
     } catch (error) {
       console.error(`Error deleting bot ${botId}:`, error);
@@ -244,6 +352,18 @@ class Storage {
     } else {
       this.botCache.clear();
     }
+  }
+
+  // SECURITY FIX: Periodic cache cleanup
+  startCacheCleanup() {
+    setInterval(() => {
+      const now = Date.now();
+      for (const [botId, cached] of this.botCache.entries()) {
+        if (now - cached.timestamp > this.CACHE_TTL) {
+          this.botCache.delete(botId);
+        }
+      }
+    }, 60000); // Clean every minute
   }
 
   // Change detection for updates
@@ -316,7 +436,13 @@ class Storage {
   async saveConfig(configName, data) {
     try {
       const filePath = path.join(this.configDir, `${configName}.json`);
-      await fsPromises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+      
+      // SECURITY FIX: Atomic write with temp file
+      const tempPath = `${filePath}.tmp`;
+      await fsPromises.writeFile(tempPath, JSON.stringify(data, null, 2), 'utf8');
+      await fsPromises.rename(tempPath, filePath);
+      await fsPromises.chmod(filePath, 0o640);
+      
       return true;
     } catch (error) {
       console.error(`Error saving config ${configName}:`, error);
