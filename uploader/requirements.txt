@@ -9,3 +9,5 @@ requests>=2.28.0
 
 # For building executable
 pyinstaller>=5.0
+
+# Note: Uses built-in logging module (no additional dependency required)
