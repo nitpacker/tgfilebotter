@@ -330,6 +330,7 @@ telegram-bot-system/
 - **500-1000 bots:** Consider PostgreSQL/SQLite migration
 - **1000+ bots:** Definitely use database + Redis sessions
 - **5000+ bots:** Add load balancer + multiple instances
+
 See [MAINTENANCE_GUIDE.md](docs/MAINTENANCE_GUIDE.md) for detailed scaling information.
 
 ---
