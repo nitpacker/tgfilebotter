@@ -18,7 +18,7 @@
   "license": "ISC",
   "dependencies": {
     "express": "^4.18.2",
-	"proper-lockfile": "^4.1.2",
+    "proper-lockfile": "^4.1.2",
     "node-telegram-bot-api": "^0.64.0",
     "helmet": "^7.1.0",
     "express-rate-limit": "^7.1.5",
