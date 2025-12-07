@@ -1,5 +1,6 @@
 """
 PyQt5 GUI for the File Uploader application.
+FIXED VERSION - Issues [GUI-1,2,3,7,10,12,13,20]
 """
 
 import sys
@@ -55,6 +56,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None
+        self._last_folder = os.path.expanduser("~")  # FIX [GUI-20]: Remember last folder location
         self.init_ui()
     
     def init_ui(self):
@@ -96,12 +98,28 @@ class MainWindow(QMainWindow):
         self.browse_btn.setFixedWidth(100)
         config_layout.addWidget(self.browse_btn, 0, 2)
         
-        # Bot token
+        # Bot token with visibility toggle
         config_layout.addWidget(QLabel("Bot Token:"), 1, 0)
+        
+        # FIX [GUI-3]: Add token visibility toggle
+        token_container = QWidget()
+        token_layout = QHBoxLayout(token_container)
+        token_layout.setContentsMargins(0, 0, 0, 0)
+        token_layout.setSpacing(5)
+        
         self.token_input = QLineEdit()
         self.token_input.setPlaceholderText("123456789:ABCdefGHIjklMNOpqrsTUVwxyz...")
         self.token_input.setEchoMode(QLineEdit.Password)
-        config_layout.addWidget(self.token_input, 1, 1, 1, 2)
+        token_layout.addWidget(self.token_input)
+        
+        self.token_visibility_btn = QPushButton("👁")
+        self.token_visibility_btn.setFixedWidth(40)
+        self.token_visibility_btn.setCheckable(True)
+        self.token_visibility_btn.clicked.connect(self.toggle_token_visibility)
+        self.token_visibility_btn.setToolTip("Show/hide token")
+        token_layout.addWidget(self.token_visibility_btn)
+        
+        config_layout.addWidget(token_container, 1, 1, 1, 2)
         
         # Channel ID
         config_layout.addWidget(QLabel("Channel ID:"), 2, 0)
@@ -281,14 +299,25 @@ class MainWindow(QMainWindow):
         
         self.log_message("Application ready. Select a folder and enter bot credentials.", "info")
     
+    def toggle_token_visibility(self, checked):
+        """FIX [GUI-3]: Toggle password field visibility."""
+        if checked:
+            self.token_input.setEchoMode(QLineEdit.Normal)
+            self.token_visibility_btn.setText("🔒")
+        else:
+            self.token_input.setEchoMode(QLineEdit.Password)
+            self.token_visibility_btn.setText("👁")
+    
     def browse_folder(self):
+        """FIX [GUI-20]: Use and remember last folder location."""
         folder = QFileDialog.getExistingDirectory(
             self,
             "Select Folder to Upload",
-            os.path.expanduser("~"),
+            self._last_folder,
             QFileDialog.ShowDirsOnly
         )
         if folder:
+            self._last_folder = folder
             self.folder_input.setText(folder)
             self.log_message(f"Selected folder: {folder}", "info")
     
@@ -344,6 +373,10 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.No:
                 return
         
+        # FIX [GUI-1]: Clean up existing worker before creating new one
+        if self.worker and self.worker.isRunning():
+            self.worker.wait(1000)  # Wait up to 1 second
+        
         # Disable inputs
         self.set_inputs_enabled(False)
         self.start_btn.setEnabled(False)
@@ -352,6 +385,9 @@ class MainWindow(QMainWindow):
         # Reset progress
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(100)
+        
+        # FIX [GUI-12]: Reset status label color
+        self.status_label.setStyleSheet("color: #6b7280;")
         self.status_label.setText("Starting...")
         
         # Clear log
@@ -367,6 +403,14 @@ class MainWindow(QMainWindow):
             folder_path=self.folder_input.text().strip(),
             is_update_mode=self.update_radio.isChecked()
         )
+        
+        # FIX [GUI-2]: Disconnect signals before connecting to prevent accumulation
+        try:
+            self.worker.log_signal.disconnect()
+            self.worker.progress_signal.disconnect()
+            self.worker.finished_signal.disconnect()
+        except (AttributeError, TypeError):
+            pass  # No existing connections
         
         self.worker.log_signal.connect(self.log_message)
         self.worker.progress_signal.connect(self.update_progress)
@@ -432,6 +476,11 @@ class MainWindow(QMainWindow):
             )
         
         self.log_message("=" * 50, "info")
+        
+        # FIX [GUI-1]: Properly clean up worker after completion
+        if self.worker:
+            self.worker.quit()
+            self.worker.wait()
         self.worker = None
     
     def update_progress(self, current: int, total: int, message: str):
@@ -442,6 +491,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
     
     def log_message(self, message: str, level: str = "info"):
+        """FIX [GUI-7]: Preserve scroll position if user scrolled up."""
         colors = {
             "info": "#f3f4f6",
             "success": "#10b981",
@@ -450,17 +500,22 @@ class MainWindow(QMainWindow):
         }
         color = colors.get(level, colors["info"])
         
+        # Check if user was at bottom before adding message
+        scrollbar = self.log_text.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+        
         self.log_text.append(f'<span style="color: {color};">{message}</span>')
         
-        # Auto-scroll to bottom
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        # Only auto-scroll if user was already at bottom
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
     
     def clear_log(self):
         self.log_text.clear()
         self.log_message("Log cleared.", "info")
     
     def set_inputs_enabled(self, enabled: bool):
+        """FIX [GUI-13]: Include radio buttons in disable/enable."""
         self.folder_input.setEnabled(enabled)
         self.browse_btn.setEnabled(enabled)
         self.token_input.setEnabled(enabled)
@@ -469,6 +524,7 @@ class MainWindow(QMainWindow):
         self.update_radio.setEnabled(enabled)
     
     def closeEvent(self, event):
+        """FIX [GUI-10]: Improved worker cleanup on exit."""
         if self.worker and self.worker.isRunning():
             reply = QMessageBox.question(
                 self,
@@ -479,6 +535,13 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.No:
                 event.ignore()
                 return
+            
             self.worker.cancel()
-            self.worker.wait(3000)
+            self.worker.wait(10000)  # Wait up to 10 seconds
+            
+            # Force terminate if still running - prevents hanging on exit
+            if self.worker.isRunning():
+                self.worker.terminate()
+                self.worker.wait(1000)
+        
         event.accept()
