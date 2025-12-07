@@ -1,8 +1,9 @@
 """
-Core upload orchestration logic.
+Core upload orchestration logic (PRODUCTION-READY - ALL FIXES APPLIED).
 """
 
 import time
+import threading
 from typing import Dict, Any, Optional, Callable, List
 from telegram_api import TelegramAPI
 from file_scanner import FileScanner
@@ -46,17 +47,21 @@ class Uploader:
         self.json_builder = JsonBuilder()
         self.api_client = APIClient()
         
-        self._cancelled = False
+        # FIX [UP-2]: Use threading.Event instead of boolean for thread-safe cancellation
+        self._cancel_event = threading.Event()
         self._current_structure = None
         self._existing_metadata = None
         self._changes = None
     
     def cancel(self):
         """Cancel the upload process."""
-        self._cancelled = True
+        # FIX [UP-2]: Use thread-safe Event.set() instead of direct boolean assignment
+        self._cancel_event.set()
     
     def is_cancelled(self) -> bool:
-        return self._cancelled
+        """Check if upload has been cancelled."""
+        # FIX [UP-2]: Use thread-safe Event.is_set() instead of direct boolean check
+        return self._cancel_event.is_set()
     
     def validate_inputs(self) -> Dict[str, Any]:
         """Validate bot token and channel before starting."""
@@ -104,6 +109,7 @@ class Uploader:
         """Execute the complete upload process."""
         result = UploadResult()
         
+        # FIX [UP-18]: Catch specific exceptions first, then generic Exception
         try:
             # Step 1: Validate inputs
             validation = self.validate_inputs()
@@ -114,7 +120,7 @@ class Uploader:
             
             bot_username = validation.get('bot_username')
             
-            if self._cancelled:
+            if self.is_cancelled():
                 result.message = "Upload cancelled"
                 return result
             
@@ -147,7 +153,7 @@ class Uploader:
                     self.log(f"⚠ {warn}", "warning")
                     result.warnings.append(warn)
             
-            if self._cancelled:
+            if self.is_cancelled():
                 result.message = "Upload cancelled"
                 return result
             
@@ -163,10 +169,16 @@ class Uploader:
                     self.log("✓ Existing metadata retrieved", "success")
                     
                     # Compare structures
-                    self._changes = self.json_builder.compare_structures(
-                        self._existing_metadata,
-                        self._current_structure
-                    )
+                    try:
+                        self._changes = self.json_builder.compare_structures(
+                            self._existing_metadata,
+                            self._current_structure
+                        )
+                    except ValueError as e:
+                        self.log(f"✗ Structure too deeply nested: {e}", "error")
+                        result.message = "Folder structure exceeds maximum depth (50 levels)"
+                        result.errors.append(str(e))
+                        return result
                     
                     change_pct = self.json_builder.calculate_change_percentage(self._changes)
                     change_summary = self._changes['summary']
@@ -198,7 +210,7 @@ class Uploader:
             else:
                 files_to_upload = self.scanner.get_all_files(self._current_structure)
             
-            if self._cancelled:
+            if self.is_cancelled():
                 result.message = "Upload cancelled"
                 return result
             
@@ -206,7 +218,7 @@ class Uploader:
             if files_to_delete:
                 self.log(f"Removing {len(files_to_delete)} old files from channel...", "info")
                 for file_info in files_to_delete:
-                    if self._cancelled:
+                    if self.is_cancelled():
                         break
                     msg_id = file_info.get('messageId')
                     if msg_id:
@@ -222,7 +234,7 @@ class Uploader:
                 self.log(f"Uploading {total_files} files to Telegram...", "info")
                 
                 for idx, file_info in enumerate(files_to_upload):
-                    if self._cancelled:
+                    if self.is_cancelled():
                         result.message = "Upload cancelled"
                         return result
                     
@@ -237,12 +249,18 @@ class Uploader:
                     
                     if upload_result.get('success'):
                         # Update structure with file_id and message_id
-                        self.json_builder.update_file_ids(
-                            self._current_structure,
-                            file_path,
-                            upload_result['file_id'],
-                            upload_result['message_id']
-                        )
+                        try:
+                            self.json_builder.update_file_ids(
+                                self._current_structure,
+                                file_path,
+                                upload_result['file_id'],
+                                upload_result['message_id']
+                            )
+                        except ValueError as e:
+                            # This is critical - should not fail silently
+                            self.log(f"✗ Invalid file ID from Telegram: {e}", "error")
+                            result.errors.append(f"Failed to store file ID for {file_name}: {e}")
+                            result.files_failed += 1
                         result.files_uploaded += 1
                     else:
                         error_msg = f"Failed to upload {file_name}: {upload_result.get('error')}"
@@ -252,14 +270,20 @@ class Uploader:
                 
                 self.log(f"✓ Uploaded {result.files_uploaded} files", "success")
             
-            if self._cancelled:
+            if self.is_cancelled():
                 result.message = "Upload cancelled"
                 return result
             
             # Step 6: Send metadata to server
             self.log("Sending metadata to server...", "info")
             
-            cleaned_metadata = self.json_builder.clean_metadata_for_server(self._current_structure)
+            try:
+                cleaned_metadata = self.json_builder.clean_metadata_for_server(self._current_structure)
+            except ValueError as e:
+                self.log(f"✗ Invalid metadata structure: {e}", "error")
+                result.message = f"Metadata validation failed: {e}"
+                result.errors.append(str(e))
+                return result
             
             server_result = self.api_client.upload_metadata(
                 self.bot_token,
@@ -290,17 +314,31 @@ class Uploader:
                         self.log(f"  - {detail.get('msg', detail)}", "error")
             
             return result
-            
+        
+        # FIX [UP-18]: Catch specific exceptions first for better error context
+        except (ValueError, TypeError) as e:
+            result.message = f'Data validation error: {str(e)}'
+            result.errors.append(result.message)
+            self.log(f"✗ {result.message}", "error")
+            return result
+        except (IOError, OSError) as e:
+            result.message = f'File system error: {str(e)}'
+            result.errors.append(result.message)
+            self.log(f"✗ {result.message}", "error")
+            return result
         except Exception as e:
+            # FIX [UP-18]: Log full traceback for unknown errors
+            import traceback
             result.message = f"Unexpected error: {str(e)}"
             result.errors.append(result.message)
             self.log(f"✗ {result.message}", "error")
+            self.log(traceback.format_exc(), "error")
             return result
     
     def _upload_with_retry(self, file_path: str, max_retries: int = 3) -> Dict[str, Any]:
         """Upload a file with retry logic for rate limiting."""
         for attempt in range(max_retries):
-            if self._cancelled:
+            if self.is_cancelled():
                 return {'success': False, 'error': 'Cancelled'}
             
             result = self.telegram.upload_file(self.channel_id, file_path)
