@@ -1,6 +1,7 @@
 // bot-manager.js - Manages Multiple Telegram Bots (PRODUCTION-READY - ALL FIXES APPLIED)
 const TelegramBot = require('node-telegram-bot-api');
 const Security = require('./security');
+const crypto = require('crypto');
 
 class BotManager {
   constructor(storage, config, adminBot) {
@@ -19,9 +20,16 @@ class BotManager {
     
     // Recovery monitoring
     this.recoveryInterval = null;
+    this.circuitBreakerCleanupInterval = null; // BM-2: Track cleanup interval
     
-    // CRITICAL FIX #1: Limit error tracking to prevent memory leaks
+    // CRITICAL FIX #1 (BM-3): Limit error tracking to prevent memory leaks
     this.MAX_ERROR_HISTORY = 10;
+    
+    // BM-7: Track ongoing operations to prevent race conditions
+    this.ongoingOperations = new Map(); // botId -> Promise
+    
+    // BM-16: Path hash map for long folder paths
+    this.pathHashes = new Map(); // hash -> {path, expires}
     
     // MINOR FIX #10: Structured logging
     this.logger = {
@@ -29,6 +37,19 @@ class BotManager {
       warn: (msg, ...args) => console.warn(`[BotManager] ${msg}`, ...args),
       info: (msg, ...args) => console.log(`[BotManager] ${msg}`, ...args)
     };
+  }
+
+  // BM-6: Sanitize token in messages
+  sanitizeToken(message, token) {
+    if (typeof message !== 'string') {
+      message = String(message);
+    }
+    if (token && message.includes(token)) {
+      const prefix = token.substring(0, 4);
+      const suffix = token.substring(token.length - 4);
+      return message.replace(new RegExp(token, 'g'), `${prefix}...${suffix}`);
+    }
+    return message;
   }
 
   async loadAllBots() {
@@ -63,7 +84,7 @@ class BotManager {
       // Start recovery monitor
       this.startRecoveryMonitor();
       
-      // CRITICAL FIX #5: Start circuit breaker cleanup and persistence
+      // CRITICAL FIX #5 (BM-2): Start circuit breaker cleanup and persistence
       this.startCircuitBreakerCleanup();
       
     } catch (error) {
@@ -162,8 +183,9 @@ class BotManager {
     }
   }
 
+  // BM-2: Start circuit breaker cleanup with interval tracking
   startCircuitBreakerCleanup() {
-    setInterval(() => {
+    this.circuitBreakerCleanupInterval = setInterval(() => {
       const now = Date.now();
       let cleaned = false;
       
@@ -183,6 +205,26 @@ class BotManager {
   }
 
   async addBot(botId, token, channelId, metadata, status = 'pending', ownerId = null) {
+    // BM-7: Check if operation already in progress
+    if (this.ongoingOperations.has(botId)) {
+      this.logger.warn(`Add operation already in progress for bot ${botId}`);
+      return this.ongoingOperations.get(botId);
+    }
+    
+    // Create promise for this operation
+    const operationPromise = this._addBotInternal(botId, token, channelId, metadata, status, ownerId);
+    this.ongoingOperations.set(botId, operationPromise);
+    
+    try {
+      const result = await operationPromise;
+      return result;
+    } finally {
+      this.ongoingOperations.delete(botId);
+    }
+  }
+
+  async _addBotInternal(botId, token, channelId, metadata, status, ownerId) {
+	let bot = null;
     try {
       // CRITICAL FIX #5: Check circuit breaker
       if (this.isCircuitBreakerOpen(botId)) {
@@ -191,7 +233,7 @@ class BotManager {
       }
 
       // Create bot instance with error handling
-      const bot = new TelegramBot(token, { 
+      bot = new TelegramBot(token, { 
         polling: {
           interval: 300,
           autoStart: true,
@@ -207,7 +249,9 @@ class BotManager {
         this.recordBotSuccess(botId);
       } catch (error) {
         this.recordBotFailure(botId);
-        throw new Error(`Bot token invalid or revoked: ${error.message}`);
+        // BM-6: Sanitize token in error message
+        const sanitizedError = this.sanitizeToken(error.message, token);
+        throw new Error(`Bot token invalid or revoked: ${sanitizedError}`);
       }
       
       // Store bot info
@@ -220,8 +264,10 @@ class BotManager {
         status,
         ownerId,
         started: new Date().toISOString(),
-        errors: [], // CRITICAL FIX #1: Limited error history
-        lastHealthCheck: Date.now()
+        errors: [], // CRITICAL FIX #1 (BM-3): Limited error history
+        lastHealthCheck: Date.now(),
+        consecutiveFailures: 0, // BM-11: Track consecutive failures
+        lastCheckTime: Date.now() // BM-11: Track last check time
       };
 
       this.bots.set(botId, botInfo);
@@ -234,9 +280,25 @@ class BotManager {
       return botId;
 
     } catch (error) {
-      this.logger.error(`❌ Error adding bot ${botId}:`, error);
+      // BM-6: Sanitize token in error log
+      const sanitizedError = this.sanitizeToken(error.message, token);
+      this.logger.error(`❌ Error adding bot ${botId}:`, sanitizedError);
       this.recordBotFailure(botId);
-      await this.adminBot.sendAlert('error', `Failed to initialize bot ${botId}: ${error.message}`);
+      
+      // BM-14: Cleanup partial state on failure
+      if (bot) {
+        try {
+          await bot.stopPolling();
+        } catch (stopError) {
+          // Ignore errors during cleanup
+        }
+      }
+      this.bots.delete(botId);
+      this.botTokenMap.delete(token);
+      
+      // BM-6: Sanitize token before sending alert
+      const alertMessage = this.sanitizeToken(`Failed to initialize bot ${botId}: ${error.message}`, token);
+      await this.adminBot.sendAlert('error', alertMessage);
       return null;
     }
   }
@@ -245,21 +307,21 @@ class BotManager {
     const { instance: bot, botId, channelId, metadata, status, ownerId } = botInfo;
     const adminUserId = this.config.getAdminUserId();
 
-    // CRITICAL FIX #1: Global error handler with proper error isolation
+    // CRITICAL FIX #1 (BM-3): Global error handler with proper error isolation and size check
     bot.on('polling_error', (error) => {
-      this.logger.error(`Polling error for bot ${botId}:`, error);
+      // BM-6: Sanitize token in error log
+      const sanitizedError = this.sanitizeToken(error.message, botInfo.token);
+      this.logger.error(`Polling error for bot ${botId}:`, sanitizedError);
       
-      // CRITICAL FIX #1: Limit error history
+      // CRITICAL FIX #1 (BM-3): Limit error history BEFORE pushing
       if (!botInfo.errors) botInfo.errors = [];
-      botInfo.errors.push({
-        timestamp: new Date().toISOString(),
-        error: error.message,
-        type: 'polling'
-      });
       
-      // Keep only recent errors
-      if (botInfo.errors.length > this.MAX_ERROR_HISTORY) {
-        botInfo.errors = botInfo.errors.slice(-this.MAX_ERROR_HISTORY);
+      if (botInfo.errors.length < this.MAX_ERROR_HISTORY) {
+        botInfo.errors.push({
+          timestamp: new Date().toISOString(),
+          error: sanitizedError,
+          type: 'polling'
+        });
       }
       
       this.recordBotFailure(botId);
@@ -281,7 +343,20 @@ class BotManager {
           await handler(...args);
           this.recordBotSuccess(botId);
         } catch (error) {
-          this.logger.error(`Handler error for bot ${botId}:`, error);
+          // BM-6: Sanitize token in error log
+          const sanitizedError = this.sanitizeToken(error.message, botInfo.token);
+          this.logger.error(`Handler error for bot ${botId}:`, sanitizedError);
+          
+          // BM-3: Check size before pushing error
+          if (!botInfo.errors) botInfo.errors = [];
+          if (botInfo.errors.length < this.MAX_ERROR_HISTORY) {
+            botInfo.errors.push({
+              timestamp: new Date().toISOString(),
+              error: sanitizedError,
+              type: 'handler'
+            });
+          }
+          
           this.recordBotFailure(botId);
           // Don't rethrow - isolate error
         }
@@ -406,8 +481,21 @@ class BotManager {
         return;
       }
 
+      // BM-16: Check for hashed path
+      let actualData = sanitizedData;
+      if (sanitizedData.startsWith('folder|hash:')) {
+        const hash = sanitizedData.substring('folder|hash:'.length);
+        const cached = this.pathHashes.get(hash);
+        if (cached && Date.now() < cached.expires) {
+          actualData = `folder|${cached.path}`;
+        } else {
+          await bot.answerCallbackQuery(query.id, { text: 'Path expired, please start over' });
+          return;
+        }
+      }
+
       // Parse callback data
-      const [action, ...pathParts] = sanitizedData.split('|');
+      const [action, ...pathParts] = actualData.split('|');
       const path = pathParts.join('|').split('/').filter(p => p);
 
       if (action === 'folder') {
@@ -459,7 +547,13 @@ class BotManager {
               file.messageId
             );
           } catch (error) {
-            this.logger.error(`Error forwarding file:`, error);
+            // BM-10: Log error with file context
+            this.logger.error('Error forwarding file:', {
+              fileName: file.fileName,
+              messageId: file.messageId,
+              channelId: currentFolder.channelId || metadata.channelId,
+              error: error.message
+            });
           }
         }
       }
@@ -492,10 +586,26 @@ class BotManager {
       // Create button rows
       const buttons = [];
       for (let i = 0; i < pageSubfolders.length; i += BUTTONS_PER_ROW) {
-        const row = pageSubfolders.slice(i, i + BUTTONS_PER_ROW).map(folder => ({
-          text: `📁 ${folder}`,
-          callback_data: `folder|${[...currentPath, folder].join('/')}`
-        }));
+        const row = pageSubfolders.slice(i, i + BUTTONS_PER_ROW).map(folder => {
+          // BM-16: Validate callback_data length
+          const fullPath = [...currentPath, folder].join('/');
+          let callback_data = `folder|${fullPath}`;
+          
+          if (callback_data.length > 60) {
+            // Create hash for long paths
+            const hash = require('crypto').createHash('md5').update(fullPath).digest('hex').substring(0, 8);
+            this.pathHashes.set(hash, {
+              path: fullPath,
+              expires: Date.now() + 600000 // 10 minutes
+            });
+            callback_data = `folder|hash:${hash}`;
+          }
+          
+          return {
+            text: `📁 ${folder}`,
+            callback_data: callback_data
+          };
+        });
         buttons.push(row);
       }
 
@@ -565,10 +675,23 @@ class BotManager {
     }
   }
 
+  // BM-11: Enhanced recovery monitor with exponential backoff and transient error handling
   startRecoveryMonitor() {
     this.recoveryInterval = setInterval(async () => {
       for (const [botId, botInfo] of this.bots.entries()) {
         try {
+          // Calculate backoff interval for this bot
+          const failureCount = botInfo.consecutiveFailures || 0;
+          const minInterval = 5 * 60 * 1000; // 5 minutes base
+          const backoffInterval = Math.min(minInterval * Math.pow(2, failureCount), 30 * 60 * 1000); // Max 30 min
+          
+          // Skip if not enough time has passed
+          if (Date.now() - (botInfo.lastCheckTime || 0) < backoffInterval) {
+            continue;
+          }
+          
+          botInfo.lastCheckTime = Date.now();
+          
           // Check if circuit breaker is open
           if (this.isCircuitBreakerOpen(botId)) {
             continue;
@@ -577,63 +700,108 @@ class BotManager {
           // Check if bot is still responsive
           await botInfo.instance.getMe();
           
-          // Reset error count on success
-          if (botInfo.errors) {
-            botInfo.errors = [];
-          }
-          
+          // Success - reset failure count
+          botInfo.consecutiveFailures = 0;
+          botInfo.errors = [];
           botInfo.lastHealthCheck = Date.now();
           this.recordBotSuccess(botId);
           
         } catch (error) {
           this.logger.error(`Bot ${botId} health check failed:`, error);
-          this.recordBotFailure(botId);
           
-          // Track failure
-          if (!botInfo.errors) botInfo.errors = [];
-          botInfo.errors.push({
-            timestamp: new Date().toISOString(),
-            error: error.message,
-            type: 'health_check'
-          });
+          // BM-11: Distinguish transient network errors from permanent errors
+          const isTransient = error.code === 'ETIMEDOUT' || 
+                            error.code === 'ECONNRESET' ||
+                            error.code === 'ENOTFOUND';
           
-          // Keep only recent errors
-          if (botInfo.errors.length > this.MAX_ERROR_HISTORY) {
-            botInfo.errors = botInfo.errors.slice(-this.MAX_ERROR_HISTORY);
-          }
-
-          // If failed multiple times and not in circuit breaker, attempt restart
-          if (botInfo.errors.length >= 3 && !this.isCircuitBreakerOpen(botId)) {
-            this.logger.info(`Attempting to restart bot ${botId}...`);
+          if (isTransient) {
+            // Increment failure count but don't restart immediately
+            botInfo.consecutiveFailures = (botInfo.consecutiveFailures || 0) + 1;
             
-            try {
-              await this.stopBot(botId);
-              
-              const bot = this.storage.getBotById(botId);
-              if (bot && bot.status === 'approved') {
-                await this.addBot(
-                  botId,
-                  bot.botToken,
-                  bot.channelId,
-                  bot.metadata,
-                  bot.status,
-                  bot.ownerId
-                );
+            // Only restart after 5 consecutive timeouts
+            if (botInfo.consecutiveFailures >= 5) {
+              this.logger.info(`Bot ${botId} has 5 consecutive failures, attempting restart`);
+                                      
+              try {
+                // BM-17: Await stop and add delay before restart
+                await this.stopBot(botId);
                 
-                await this.adminBot.sendAlert('recovery', 
-                  `Bot ${botId} was automatically restarted after health check failure`
+                // Wait 2 seconds for cleanup
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                const bot = this.storage.getBotById(botId);
+                if (bot && bot.status === 'approved') {
+                  await this.addBot(
+                    botId,
+                    bot.botToken,
+                    bot.channelId,
+                    bot.metadata,
+                    bot.status,
+                    bot.ownerId
+                  );
+                  
+                  await this.adminBot.sendAlert('recovery', 
+                    `Bot ${botId} was automatically restarted after health check failure`
+                  );
+                }
+              } catch (restartError) {
+                this.logger.error(`Failed to restart bot ${botId}:`, restartError);
+                await this.adminBot.sendAlert('error',
+                  `Failed to auto-restart bot ${botId}: ${restartError.message}`
                 );
               }
-            } catch (restartError) {
-              this.logger.error(`Failed to restart bot ${botId}:`, restartError);
-              await this.adminBot.sendAlert('error',
-                `Failed to auto-restart bot ${botId}: ${restartError.message}`
-              );
             }
-          }
-        }
-      }
-    }, 5 * 60 * 1000); // Every 5 minutes
+          } else {
+            // Permanent error - record and attempt restart
+            this.recordBotFailure(botId);
+            
+            // Track failure
+            if (!botInfo.errors) botInfo.errors = [];
+            if (botInfo.errors.length < this.MAX_ERROR_HISTORY) {
+              botInfo.errors.push({
+                timestamp: new Date().toISOString(),
+                error: error.message,
+                type: 'health_check'
+              });
+            }
+
+            // If failed multiple times and not in circuit breaker, attempt restart
+            if (botInfo.errors.length >= 3 && !this.isCircuitBreakerOpen(botId)) {
+              this.logger.info(`Attempting to restart bot ${botId}...`);
+              
+              try {
+                // BM-17: Await stop and add delay before restart
+                await this.stopBot(botId);
+                
+                // Wait 2 seconds for cleanup
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                const bot = this.storage.getBotById(botId);
+                if (bot && bot.status === 'approved') {
+                  await this.addBot(
+                    botId,
+                    bot.botToken,
+                    bot.channelId,
+                    bot.metadata,
+                    bot.status,
+                    bot.ownerId
+                  );
+                  
+                  await this.adminBot.sendAlert('recovery', 
+                    `Bot ${botId} was automatically restarted after health check failure`
+                  );
+				}
+			  } catch (restartError) {
+				this.logger.error(`Failed to restart bot ${botId}:`, restartError);
+				await this.adminBot.sendAlert('error',
+				  `Failed to auto-restart bot ${botId}: ${restartError.message}`
+				);
+			  }
+            }	
+		  }
+		}
+	  }
+    }, 60 * 1000); // Check every minute, but backoff is per-bot
   }
 
   async stopBot(botId) {
@@ -644,6 +812,10 @@ class BotManager {
       } catch (error) {
         this.logger.error(`Error stopping bot ${botId}:`, error);
       }
+      
+      // BM-13: Clear cache
+      this.storage.clearCache(botId);
+      
       this.bots.delete(botId);
       this.botTokenMap.delete(botInfo.token);
       this.logger.info(`✓ Bot ${botId} stopped`);
@@ -656,17 +828,30 @@ class BotManager {
       clearInterval(this.recoveryInterval);
     }
     
+    // BM-2: Clear circuit breaker cleanup interval
+    if (this.circuitBreakerCleanupInterval) {
+      clearInterval(this.circuitBreakerCleanupInterval);
+    }
+    
     // CRITICAL FIX #5: Save circuit breaker state before shutdown
     await this.saveCircuitBreakerState();
     
     this.logger.info('Stopping all bots...');
+    
+    // BM-18: Collect all stop promises and wait
+    const stopPromises = [];
+    
     for (const [botId, botInfo] of this.bots.entries()) {
-      try {
-        await botInfo.instance.stopPolling();
-      } catch (error) {
-        this.logger.error(`Error stopping bot ${botId}:`, error);
-      }
+      const stopPromise = botInfo.instance.stopPolling()
+        .catch(error => {
+          this.logger.error(`Error stopping bot ${botId}:`, error);
+        });
+      stopPromises.push(stopPromise);
     }
+    
+    // Wait for all stops to complete
+    await Promise.all(stopPromises);
+    
     this.bots.clear();
     this.botTokenMap.clear();
     this.logger.info('✓ All bots stopped');
