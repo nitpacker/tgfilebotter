@@ -59,18 +59,47 @@ def clean_build():
     
     for folder in [BUILD_DIR, OUTPUT_DIR, "__pycache__"]:
         if os.path.exists(folder):
-            shutil.rmtree(folder)
-            print(f"  Removed {folder}/")
+            try:
+                shutil.rmtree(folder)
+                print(f"  Removed {folder}/")
+            except PermissionError as e:
+                print(f"  Warning: Could not remove {folder} (in use): {str(e)}")
+                continue
+            except OSError as e:
+                print(f"  Warning: Could not remove {folder}: {str(e)}")
+                continue
     
     # Remove .spec file
     spec_file = f"{APP_NAME}.spec"
     if os.path.exists(spec_file):
-        os.remove(spec_file)
-        print(f"  Removed {spec_file}")
+        try:
+            os.remove(spec_file)
+            print(f"  Removed {spec_file}")
+        except (PermissionError, OSError) as e:
+            print(f"  Warning: Could not remove {spec_file}: {str(e)}")
 
 def build_executable():
     """Build the Windows executable using PyInstaller."""
     print("\nBuilding executable...")
+    
+    # Check if main script exists
+    if not os.path.exists(MAIN_SCRIPT):
+        print(f"  ERROR: Required file not found: {MAIN_SCRIPT}")
+        return False
+    
+    # Check if config.py exists (required for uploader)
+    if not os.path.exists('config.py'):
+        print(f"  ERROR: Required file not found: config.py")
+        return False
+    
+    # Verify required Python modules can be imported
+    required_modules = [('PyQt5', 'PyQt5'), ('requests', 'requests')]
+    for module_name, import_name in required_modules:
+        try:
+            __import__(import_name)
+        except ImportError:
+            print(f"  ERROR: Required module not installed: {module_name}")
+            return False
     
     # PyInstaller command
     cmd = [
@@ -112,7 +141,18 @@ def build_executable():
     # Run PyInstaller
     result = subprocess.run(cmd)
     
-    return result.returncode == 0
+    # Validate return code
+    if result.returncode != 0:
+        print(f"  ✗ PyInstaller failed with exit code: {result.returncode}")
+        return False
+    
+    # Secondary validation: check if executable was created
+    exe_path = os.path.join(OUTPUT_DIR, f"{APP_NAME}.exe")
+    if not os.path.exists(exe_path):
+        print(f"  ✗ Executable not found at expected path: {exe_path}")
+        return False
+    
+    return True
 
 def post_build():
     """Post-build tasks."""
@@ -121,9 +161,15 @@ def post_build():
     exe_path = os.path.join(OUTPUT_DIR, f"{APP_NAME}.exe")
     
     if os.path.exists(exe_path):
-        file_size = os.path.getsize(exe_path) / 1024 / 1024
+        try:
+            file_size = os.path.getsize(exe_path) / 1024 / 1024
+        except OSError:
+            file_size = 0
+            print(f"  Warning: Could not determine file size")
+        
         print(f"  ✓ Executable created: {exe_path}")
-        print(f"  ✓ File size: {file_size:.1f} MB")
+        if file_size > 0:
+            print(f"  ✓ File size: {file_size:.1f} MB")
         
         # Rename to include version
         final_name = f"{APP_NAME}_v{APP_VERSION}.exe"
@@ -146,22 +192,37 @@ def cleanup_temp():
     
     # Remove build directory
     if os.path.exists(BUILD_DIR):
-        shutil.rmtree(BUILD_DIR)
-        print(f"  Removed {BUILD_DIR}/")
+        try:
+            shutil.rmtree(BUILD_DIR)
+            print(f"  Removed {BUILD_DIR}/")
+        except PermissionError:
+            print(f"  Warning: Could not remove {BUILD_DIR} (in use)")
+        except OSError as e:
+            print(f"  Warning: Could not remove {BUILD_DIR}: {str(e)}")
     
     # Remove .spec file
     spec_file = f"{APP_NAME}.spec"
     if os.path.exists(spec_file):
-        os.remove(spec_file)
-        print(f"  Removed {spec_file}")
+        try:
+            os.remove(spec_file)
+            print(f"  Removed {spec_file}")
+        except (PermissionError, OSError) as e:
+            print(f"  Warning: Could not remove {spec_file}: {str(e)}")
     
     # Remove __pycache__
     for root, dirs, files in os.walk("."):
         for d in dirs:
             if d == "__pycache__":
                 path = os.path.join(root, d)
-                shutil.rmtree(path)
-                print(f"  Removed {path}")
+                try:
+                    shutil.rmtree(path)
+                    print(f"  Removed {path}")
+                except PermissionError:
+                    print(f"  Warning: Could not remove {path} (in use)")
+                    continue
+                except OSError as e:
+                    print(f"  Warning: Could not remove {path}: {str(e)}")
+                    continue
 
 def main():
     print("=" * 60)
