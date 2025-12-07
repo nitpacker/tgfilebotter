@@ -1,22 +1,14 @@
-// storage.js - JSON File Storage Management (RACE CONDITION FIXES)
+// storage.js - JSON File Storage Management (RACE CONDITION FIXES + ALL BUG FIXES APPLIED)
 const fs = require('fs');
 const fsPromises = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
 
-// SECURITY FIX: Use proper-lockfile for file locking
-// Install with: npm install proper-lockfile
-let lockfile;
-try {
-  lockfile = require('proper-lockfile');
-} catch (error) {
-  console.warn('⚠️  proper-lockfile not installed. File locking disabled. Install with: npm install proper-lockfile');
-  // Fallback to no locking
-  lockfile = {
-    lock: async () => () => {},
-    unlock: async () => {}
-  };
-}
+// CRITICAL FIX [ST-12]: Make proper-lockfile mandatory for data integrity
+// If this import fails, the error message will be clear:
+// "Cannot find module 'proper-lockfile'"
+// Solution: npm install proper-lockfile
+const lockfile = require('proper-lockfile');
 
 class Storage {
   constructor() {
@@ -53,12 +45,21 @@ class Storage {
       
       console.log('✓ Storage directories initialized');
     } catch (error) {
-      console.error('Error initializing directories:', error);
-      throw error;
+      // FIX [ST-8]: Add specific error handling for EACCES and ENOSPC
+      if (error.code === 'EACCES') {
+        console.error('❌ Permission denied creating storage directories');
+        console.error('   Run with appropriate permissions or check directory ownership');
+      } else if (error.code === 'ENOSPC') {
+        console.error('❌ No space left on device');
+        console.error('   Free up disk space and try again');
+      } else {
+        console.error('Error initializing directories:', error);
+      }
+      throw error; // Re-throw with better context
     }
   }
 
-  // SECURITY FIX: Atomic bot status update with file locking
+  // FIX [ST-1]: Atomic bot status update with proper nested try/finally for lock release
   async updateBotStatusAtomic(botId, status) {
     const operationId = `status_${botId}_${Date.now()}`;
     
@@ -71,11 +72,11 @@ class Storage {
     
     this.ongoingOperations.add(botId);
     
+    let release;
     try {
       const filePath = path.join(this.botsDir, `bot_${botId}.json`);
       
       // Acquire file lock
-      let release;
       try {
         release = await lockfile.lock(filePath, {
           retries: {
@@ -86,7 +87,7 @@ class Storage {
         });
       } catch (error) {
         console.error(`Failed to acquire lock for bot ${botId}:`, error);
-        this.ongoingOperations.delete(botId);
+		this.ongoingOperations.delete(botId); // Delete here on lock failure
         return false;
       }
       
@@ -113,8 +114,8 @@ class Storage {
         
         return true;
       } finally {
-        // Release lock
-        await release();
+        // FIX [ST-1]: CRITICAL - Release lock in inner finally
+        if (release) await release();
       }
     } catch (error) {
       console.error(`Error updating bot status for ${botId}:`, error);
@@ -204,22 +205,24 @@ class Storage {
     }
   }
 
-  // DEPRECATED: Use saveBot() instead - kept for backward compatibility
+  // FIX [ST-2]: DEPRECATED - Use saveBot() instead - kept for backward compatibility with cleanup
   saveBotSync(bot) {
     const filePath = path.join(this.botsDir, `bot_${bot.id}.json`);
+    const tempPath = `${filePath}.tmp`;
+    
     try {
       // SECURITY FIX: Write to temp file first, then rename (atomic operation)
-      const tempPath = `${filePath}.tmp`;
       fs.writeFileSync(tempPath, JSON.stringify(bot, null, 2), 'utf8');
       fs.renameSync(tempPath, filePath);
       fs.chmodSync(filePath, 0o640);
       this.clearCache(bot.id);
     } catch (err) {
       console.error(`Error saving bot ${bot.id}:`, err);
-      // Cleanup temp file if exists
+    } finally {
+      // FIX [ST-2]: Ensure temp file is cleaned up
       try {
-        if (fs.existsSync(`${filePath}.tmp`)) {
-          fs.unlinkSync(`${filePath}.tmp`);
+        if (fs.existsSync(tempPath)) {
+          fs.unlinkSync(tempPath);
         }
       } catch (cleanupErr) {
         // Ignore cleanup errors
@@ -253,7 +256,15 @@ class Storage {
       
       return bot;
     } catch (error) {
-      console.error(`Error reading bot ${botId}:`, error);
+      // FIX [ST-4]: Log parse errors with details
+      if (error instanceof SyntaxError) {
+        console.error(`JSON parse error for bot ${botId}:`, {
+          file: path.join(this.botsDir, `bot_${botId}.json`),
+          error: error.message
+        });
+      } else {
+        console.error(`Error reading bot ${botId}:`, error);
+      }
       return null;
     }
   }
@@ -280,7 +291,15 @@ class Storage {
             const bot = JSON.parse(data);
             bots.push(bot);
           } catch (error) {
-            console.error(`Error reading bot file ${file}:`, error);
+            // FIX [ST-4]: Log parse errors with details for getAllBots
+            if (error instanceof SyntaxError) {
+              console.error(`JSON parse error in file ${file}:`, {
+                file: path.join(this.botsDir, file),
+                error: error.message
+              });
+            } else {
+              console.error(`Error reading bot file ${file}:`, error);
+            }
           }
         }
       }
@@ -428,7 +447,15 @@ class Storage {
       if (error.code === 'ENOENT') {
         return null;
       }
-      console.error(`Error loading config ${configName}:`, error);
+      // FIX [ST-4]: Log parse errors with details for config files
+      if (error instanceof SyntaxError) {
+        console.error(`JSON parse error for config ${configName}:`, {
+          file: path.join(this.configDir, `${configName}.json`),
+          error: error.message
+        });
+      } else {
+        console.error(`Error loading config ${configName}:`, error);
+      }
       throw error;
     }
   }
