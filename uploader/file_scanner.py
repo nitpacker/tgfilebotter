@@ -4,6 +4,7 @@ Recursive file and folder scanner with validation.
 
 import os
 import re
+import unicodedata
 from typing import Dict, List, Any, Tuple, Optional
 from config import (
     FOLDER_NAME_PATTERN, 
@@ -37,15 +38,37 @@ class FileScanner:
         if not name or not name.strip():
             return False, "Folder name is empty"
         
+        # FIX [FS-5]: Save original name and validate stripped version
+        original_name = name
         name = name.strip()
+        
+        # FIX [FS-5]: Check if stripping changed the name
+        if name != original_name:
+            return False, "Leading/trailing spaces not allowed"
+        
+        # FIX [FS-15]: Unicode normalization (NFC = Canonical Composition)
+        name = unicodedata.normalize('NFC', name)
         
         # Check length
         if len(name) > 255:
             return False, f"Folder name too long ({len(name)} > 255 chars)"
         
-        # Check for path traversal
-        if '..' in name or '/' in name or '\\' in name:
+        # FIX [FS-6]: Enhanced path traversal checks
+        # Check for '..' (path traversal)
+        if '..' in name:
             return False, "Path traversal characters not allowed"
+        
+        # FIX [FS-6]: Check for absolute paths (Unix and Windows)
+        if name.startswith(('/', '\\')):
+            return False, "Absolute paths not allowed"
+        
+        # FIX [FS-6]: Check for Windows drive letters
+        if ':' in name:
+            return False, "Absolute paths not allowed"
+        
+        # FIX [FS-6]: Check for current directory reference
+        if name.startswith('./') or name.startswith('.\\'):
+            return False, "Relative path references not allowed"
         
         # Check for dangerous patterns
         for pattern in DANGEROUS_PATTERNS:
@@ -64,25 +87,53 @@ class FileScanner:
         if not name or not name.strip():
             return False, "File name is empty"
         
+        # FIX [FS-5]: Save original name and validate stripped version
+        original_name = name
         name = name.strip()
+        
+        # FIX [FS-5]: Check if stripping changed the name
+        if name != original_name:
+            return False, "Leading/trailing spaces not allowed"
+        
+        # FIX [FS-15]: Unicode normalization (NFC = Canonical Composition)
+        name = unicodedata.normalize('NFC', name)
         
         if len(name) > 255:
             return False, f"File name too long ({len(name)} > 255 chars)"
         
-        # Check for path traversal
-        if '..' in name or '/' in name or '\\' in name:
+        # FIX [FS-6]: Enhanced path traversal checks
+        # Check for '..' (path traversal)
+        if '..' in name:
             return False, "Path traversal characters not allowed"
+        
+        # FIX [FS-6]: Check for absolute paths (Unix and Windows)
+        if name.startswith(('/', '\\')):
+            return False, "Absolute paths not allowed"
+        
+        # FIX [FS-6]: Check for Windows drive letters
+        if ':' in name:
+            return False, "Absolute paths not allowed"
+        
+        # FIX [FS-6]: Check for current directory reference
+        if name.startswith('./') or name.startswith('.\\'):
+            return False, "Relative path references not allowed"
         
         return True, None
     
     def scan_directory(
         self, 
         root_path: str,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[callable] = None,
+        max_depth: int = 20
     ) -> Dict[str, Any]:
         """
         Scan a directory recursively and build structure.
         Returns a dictionary representing the folder hierarchy.
+        
+        Args:
+            root_path: Path to scan
+            progress_callback: Optional callback for progress updates
+            max_depth: Maximum recursion depth (default 20, prevents infinite loops from symlinks)
         """
         self.reset()
         
@@ -98,8 +149,13 @@ class FileScanner:
         total_items = sum(len(files) + len(dirs) for _, dirs, files in os.walk(root_path))
         processed = 0
         
-        def scan_folder(folder_path: str, relative_path: str = "") -> Dict[str, Any]:
+        def scan_folder(folder_path: str, relative_path: str = "", depth: int = 0) -> Dict[str, Any]:
             nonlocal processed
+            
+            # FIX [FS-1]: Check maximum depth to prevent infinite recursion
+            if depth > max_depth:
+                self.errors.append(f'Maximum depth ({max_depth}) exceeded at {folder_path}')
+                return {'files': [], 'subfolders': {}}
             
             result = {
                 'files': [],
@@ -123,8 +179,15 @@ class FileScanner:
                 entry_relative = os.path.join(relative_path, entry) if relative_path else entry
                 
                 processed += 1
-                if progress_callback and total_items > 0:
+                
+                # FIX [FS-8]: Guard against division by zero
+                if total_items > 0 and progress_callback:
                     progress_callback(processed, total_items, f"Scanning: {entry}")
+                
+                # FIX [FS-9]: Check for symlinks BEFORE checking if directory/file
+                if os.path.islink(entry_path):
+                    self.warnings.append(f'Skipping symlink: {entry}')
+                    continue
                 
                 if os.path.isdir(entry_path):
                     # Validate folder name
@@ -135,8 +198,8 @@ class FileScanner:
                     
                     self.total_folders += 1
                     
-                    # Recursively scan subfolder
-                    result['subfolders'][entry] = scan_folder(entry_path, entry_relative)
+                    # FIX [FS-1]: Pass depth + 1 to recursive call
+                    result['subfolders'][entry] = scan_folder(entry_path, entry_relative, depth + 1)
                     
                 elif os.path.isfile(entry_path):
                     # Validate file name
