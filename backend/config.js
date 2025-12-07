@@ -1,7 +1,10 @@
-// config.js - Configuration Management
+// config.js - Configuration Management (FIXES APPLIED)
+const Security = require('./security');
+
 class Config {
   constructor(storage) {
     this.storage = storage;
+    this.security = new Security();
     this.config = {
       admin: null,
       system: null
@@ -60,6 +63,26 @@ class Config {
   }
 
   async setAdminConfig(userId, botToken, channelId) {
+    // CRITICAL FIX [CFG-3]: Validate userId if provided
+    if (userId !== null && userId !== undefined) {
+      if (!Number.isInteger(userId)) {
+        throw new Error('Admin user ID must be an integer');
+      }
+      if (userId < 1 || userId > 9999999999) {
+        throw new Error('Admin user ID must be between 1 and 9999999999');
+      }
+    }
+    
+    // CRITICAL FIX [CFG-3]: Validate botToken format if provided
+    if (botToken && typeof botToken !== 'string') {
+      throw new Error('Bot token must be a string');
+    }
+    
+    // CRITICAL FIX [CFG-3]: Validate channelId format if provided
+    if (channelId && typeof channelId !== 'string') {
+      throw new Error('Channel ID must be a string');
+    }
+    
     this.config.admin = {
       ...this.config.admin,
       telegramUserId: userId,
@@ -108,7 +131,13 @@ class Config {
       throw new Error('Welcome message must be between 1 and 500 characters');
     }
 
-    this.config.system.welcomeMessage = message;
+    // CRITICAL FIX [CFG-4]: Sanitize welcome message before saving
+    const sanitized = this.security.sanitizeInput(message);
+    if (!sanitized) {
+      throw new Error('Invalid welcome message content');
+    }
+
+    this.config.system.welcomeMessage = sanitized;
     this.config.system.updatedAt = new Date().toISOString();
     
     await this.storage.saveConfig('system', this.config.system);
@@ -125,7 +154,13 @@ class Config {
       throw new Error('Invalid input message must be between 1 and 500 characters');
     }
 
-    this.config.system.invalidInputMessage = message;
+    // CRITICAL FIX [CFG-4]: Sanitize invalid input message before saving
+    const sanitized = this.security.sanitizeInput(message);
+    if (!sanitized) {
+      throw new Error('Invalid input message content');
+    }
+
+    this.config.system.invalidInputMessage = sanitized;
     this.config.system.updatedAt = new Date().toISOString();
     
     await this.storage.saveConfig('system', this.config.system);
