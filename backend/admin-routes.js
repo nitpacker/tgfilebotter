@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
 const fs = require('fs').promises;
 const path = require('path');
+const lockfile = require('proper-lockfile');
 
 class AdminRoutes {
   constructor(storage, config, botManager, adminBot, security) {
@@ -19,6 +20,7 @@ class AdminRoutes {
     this.failedLogins = new Map();
     this.csrfTokens = new Map();
     this.sessionFile = path.join(__dirname, '..', 'data', 'config', 'sessions.json');
+    this.failedLoginsFile = path.join(__dirname, '..', 'data', 'config', 'failed_logins.json');
     
     // Admin credentials (from environment)
     this.adminCredentials = {
@@ -26,8 +28,9 @@ class AdminRoutes {
       password: this.hashPassword(process.env.ADMIN_PASSWORD || 'admin123')
     };
     
-    // Load existing sessions on startup
+    // Load existing sessions and failed logins on startup
     this.loadSessions().catch(err => console.error('Failed to load sessions:', err));
+    this.loadFailedLogins().catch(err => console.error('Failed to load login attempts:', err));
     
     // SECURITY FIX: Cleanup old failed login attempts every 15 minutes
     setInterval(() => this.cleanupFailedLogins(), 15 * 60 * 1000);
@@ -55,14 +58,28 @@ class AdminRoutes {
       // SECURITY FIX: Ensure file has correct permissions
       await fs.chmod(this.sessionFile, 0o600);
     } catch (error) {
-      if (error.code !== 'ENOENT') {
+      if (error.code === 'ENOENT') {
+        // FIX [AR-1]: Create empty sessions file if missing
+        await fs.writeFile(this.sessionFile, '{}', {encoding: 'utf8', mode: 0o600});
+        console.log('✓ Created new sessions file');
+      } else {
         console.error('Error loading sessions:', error);
       }
     }
   }
 
   async saveSessions() {
+    let release;
     try {
+      // FIX [AR-2]: Use proper-lockfile to acquire lock before write
+      release = await lockfile.lock(this.sessionFile, {
+        retries: {
+          retries: 5,
+          minTimeout: 100,
+          maxTimeout: 1000
+        }
+      });
+      
       const sessions = {};
       for (const [token, session] of this.sessions.entries()) {
         sessions[token] = session;
@@ -75,6 +92,42 @@ class AdminRoutes {
       await fs.rename(tempFile, this.sessionFile);
     } catch (error) {
       console.error('Error saving sessions:', error);
+    } finally {
+      if (release) await release();
+    }
+  }
+
+  // FIX [AR-3]: Load failed logins from persistent storage
+  async loadFailedLogins() {
+    try {
+      const data = await fs.readFile(this.failedLoginsFile, 'utf8');
+      const stored = JSON.parse(data);
+      const now = Date.now();
+      
+      // Only restore entries less than 24h old
+      for (const [ip, attempts] of Object.entries(stored)) {
+        if (attempts.blockedUntil > now || (Date.now() - attempts.lastAttempt) < 86400000) {
+          this.failedLogins.set(ip, attempts);
+        }
+      }
+      console.log(`✓ Restored ${this.failedLogins.size} failed login entries`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        console.error('Error loading failed logins:', error);
+      }
+    }
+  }
+
+  // FIX [AR-3]: Save failed logins to persistent storage
+  async saveFailedLogins() {
+    try {
+      const stored = {};
+      for (const [ip, attempts] of this.failedLogins.entries()) {
+        stored[ip] = attempts;
+      }
+      await fs.writeFile(this.failedLoginsFile, JSON.stringify(stored, null, 2));
+    } catch (error) {
+      console.error('Error saving failed logins:', error);
     }
   }
 
@@ -92,8 +145,16 @@ class AdminRoutes {
     return crypto.randomBytes(32).toString('hex');
   }
 
-  // CRITICAL FIX #1: Generate and validate CSRF tokens with automatic cleanup
+  // FIX [AR-7]: Generate and validate CSRF tokens - reuse existing if valid
   generateCSRFToken(sessionToken) {
+    // Check if session already has valid token
+    for (const [csrfToken, data] of this.csrfTokens.entries()) {
+      if (data.sessionToken === sessionToken && data.expires > Date.now()) {
+        return csrfToken; // Reuse existing token
+      }
+    }
+    
+    // Generate new token
     const csrfToken = crypto.randomBytes(32).toString('hex');
     this.csrfTokens.set(csrfToken, {
       sessionToken,
@@ -168,6 +229,20 @@ class AdminRoutes {
       this.sessions.delete(token);
       this.saveSessions();
       return res.status(401).json({ success: false, error: 'Session expired' });
+    }
+    
+    // FIX [AR-5]: Check if IP matches to prevent session hijacking
+    if (session.ip !== req.ip) {
+      // Check if this IP is in allowed list
+      if (!session.allowedIps || !session.allowedIps.includes(req.ip)) {
+        console.warn(`Session hijacking attempt: token from ${session.ip}, request from ${req.ip}`);
+        this.sessions.delete(token);
+        this.saveSessions();
+        return res.status(401).json({ 
+          success: false, 
+          error: 'Session IP mismatch. Please log in again.' 
+        });
+      }
     }
     
     // Extend session
@@ -277,8 +352,9 @@ class AdminRoutes {
             
           } else {
             // Track failed attempt
-            const attempts = this.failedLogins.get(ip) || { count: 0, blockedUntil: 0 };
+            const attempts = this.failedLogins.get(ip) || { count: 0, blockedUntil: 0, lastAttempt: 0 };
             attempts.count++;
+            attempts.lastAttempt = Date.now();
             
             if (attempts.count >= 5) {
               attempts.blockedUntil = Date.now() + 15 * 60 * 1000; // 15 minutes
@@ -287,6 +363,9 @@ class AdminRoutes {
             }
             
             this.failedLogins.set(ip, attempts);
+            
+            // FIX [AR-3]: Save failed logins to persistent storage
+            await this.saveFailedLogins();
             
             // SECURITY FIX: Generic error message
             return res.status(401).json({ success: false, error: 'Invalid credentials' });
@@ -436,8 +515,14 @@ class AdminRoutes {
             return res.status(404).json({ success: false, error: 'Bot not found' });
           }
           
+          // FIX [AR-8]: Return early if bot already approved (idempotent operation)
           if (bot.status === 'approved') {
-            return res.json({ success: true, message: 'Bot already approved' });
+            return res.json({ 
+              success: true, 
+              message: 'Bot already approved',
+              botId: sanitizedBotId,
+              status: 'approved'
+            });
           }
           
           // Create backup of operation
