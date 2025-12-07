@@ -1,6 +1,7 @@
-// server.js - Main Backend Server Entry Point (PRODUCTION-READY WITH ALL FIXES)
+// server.js - Main Backend Server Entry Point (PRODUCTION-READY WITH ALL FIXES APPLIED)
 const express = require('express');
 const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const path = require('path');
@@ -14,7 +15,10 @@ const AdminBot = require('./admin-bot');
 const AdminRoutes = require('./admin-routes');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT) || 3000;
+const SERVER_TIMEOUT = parseInt(process.env.SERVER_TIMEOUT || '120000');
+const KEEP_ALIVE_TIMEOUT = parseInt(process.env.KEEP_ALIVE_TIMEOUT || '65000');
+const HEADERS_TIMEOUT = parseInt(process.env.HEADERS_TIMEOUT || '66000');
 
 // Initialize core components
 const storage = new Storage();
@@ -25,6 +29,12 @@ const botManager = new BotManager(storage, config, adminBot);
 
 // Initialize admin routes
 const adminRoutes = new AdminRoutes(storage, config, botManager, adminBot, security);
+
+// FIX [S-8]: Request ID generation middleware for distributed tracing
+app.use((req, res, next) => {
+  req.id = crypto.randomUUID();
+  next();
+});
 
 // Security middleware
 app.use(helmet({
@@ -47,6 +57,9 @@ app.use(helmet({
     preload: true
   }
 }));
+
+// FIX [S-11]: Missing Compression Middleware
+app.use(compression());
 
 // Trust proxy
 app.set('trust proxy', 1);
@@ -84,6 +97,7 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req, res) => {
+    console.log(`[${req.id}] Rate limit exceeded for IP: ${req.ip}`);
     res.status(429).json({
       success: false,
       error: 'Rate limit exceeded',
@@ -99,6 +113,7 @@ const uploadLimiter = rateLimit({
   message: 'Upload rate limit exceeded. Please try again later.',
   standardHeaders: true,
   handler: (req, res) => {
+    console.log(`[${req.id}] Upload rate limit exceeded for IP: ${req.ip}`);
     res.status(429).json({
       success: false,
       error: 'Upload rate limit exceeded',
@@ -107,7 +122,15 @@ const uploadLimiter = rateLimit({
   }
 });
 
-// MAJOR FIX #6: Rate limit metadata endpoint
+// FIX [S-1]: Rate limit for detailed health check endpoint
+const healthDetailedLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: 'Too many health check requests.',
+  standardHeaders: true
+});
+
+// Metadata endpoint rate limiter
 const metadataLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
@@ -119,6 +142,7 @@ app.use(globalLimiter);
 
 // PUBLIC ROUTES
 app.get('/health', (req, res) => {
+  console.log(`[${req.id}] Health check from ${req.ip}`);
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
@@ -126,21 +150,22 @@ app.get('/health', (req, res) => {
   });
 });
 
-// MAJOR FIX #9: Detailed health check with authentication
-app.get('/api/health/detailed', async (req, res) => {
+// FIX [S-1]: Detailed health check with authentication and rate limiting
+app.get('/api/health/detailed', healthDetailedLimiter, async (req, res) => {
   const token = req.query.token;
   
-  // SECURITY FIX: Generate token on first startup or use env variable
+  // Generate token on first startup or use env variable
   if (!global.HEALTH_CHECK_TOKEN) {
     global.HEALTH_CHECK_TOKEN = process.env.HEALTH_CHECK_TOKEN || 
       crypto.randomBytes(16).toString('hex');
     if (!process.env.HEALTH_CHECK_TOKEN) {
-      console.log(`⚠ Generated health check token: ${global.HEALTH_CHECK_TOKEN}`);
+      console.log(`[${req.id}] Generated health check token: ${global.HEALTH_CHECK_TOKEN}`);
       console.log('  Set HEALTH_CHECK_TOKEN in .env for persistent access');
     }
   }
   
   if (token !== global.HEALTH_CHECK_TOKEN) {
+    console.log(`[${req.id}] Unauthorized health check attempt from ${req.ip}`);
     return res.status(401).json({ error: 'Unauthorized' });
   }
   
@@ -164,6 +189,7 @@ app.get('/api/health/detailed', async (req, res) => {
         totalBots: bots.length
       };
     } catch (error) {
+      console.error(`[${req.id}] Storage check failed:`, error);
       health.checks.storage = {
         status: 'error',
         error: 'Storage check failed'
@@ -182,8 +208,10 @@ app.get('/api/health/detailed', async (req, res) => {
       heapTotal: `${Math.round(memUsage.heapTotal / 1024 / 1024)}MB`
     };
 
+    console.log(`[${req.id}] Detailed health check completed`);
     res.json(health);
   } catch (error) {
+    console.error(`[${req.id}] Health check error:`, error);
     res.status(500).json({
       status: 'error',
       error: 'Health check failed'
@@ -193,16 +221,18 @@ app.get('/api/health/detailed', async (req, res) => {
 
 // Serve admin panel
 app.get('/admin', (req, res) => {
+  console.log(`[${req.id}] Admin panel access from ${req.ip}`);
   res.sendFile(path.join(__dirname, 'public', 'admin-panel.html'));
 });
 
 // API ROUTES
 app.get('/api/csrf-token', (req, res) => {
   const token = crypto.randomBytes(32).toString('hex');
+  console.log(`[${req.id}] CSRF token generated for ${req.ip}`);
   res.json({ csrfToken: token });
 });
 
-// Bot metadata upload endpoint
+// FIX [S-9]: Bot metadata upload endpoint with idempotency support
 app.post('/api/upload',
   uploadLimiter,
   [
@@ -231,8 +261,11 @@ app.post('/api/upload',
   ],
   async (req, res) => {
     try {
+      console.log(`[${req.id}] Upload request from ${req.ip}`);
+      
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
+        console.log(`[${req.id}] Upload validation failed:`, errors.array());
         await adminBot.sendAlert('security', `Invalid upload attempt from IP: ${req.ip}`);
         return res.status(400).json({ 
           success: false, 
@@ -248,6 +281,7 @@ app.post('/api/upload',
       const sanitizedUsername = security.sanitizeInput(botUsername);
 
       if (!sanitizedToken || !sanitizedChannelId || !sanitizedUsername) {
+        console.log(`[${req.id}] Input sanitization failed`);
         return res.status(400).json({
           success: false,
           error: 'Input sanitization failed'
@@ -258,6 +292,7 @@ app.post('/api/upload',
       const maxSize = config.getMaxJsonSize();
       
       if (metadataSize > maxSize) {
+        console.log(`[${req.id}] Metadata too large: ${metadataSize} bytes`);
         return res.status(413).json({
           success: false,
           error: `JSON metadata too large. Maximum: ${maxSize / 1024 / 1024}MB, Yours: ${(metadataSize / 1024 / 1024).toFixed(2)}MB`
@@ -266,15 +301,25 @@ app.post('/api/upload',
 
       const sanitizedMetadata = security.sanitizeJSON(metadata);
       if (!sanitizedMetadata) {
+        console.log(`[${req.id}] Malicious JSON detected from ${req.ip}`);
         await adminBot.sendAlert('security', `Malicious JSON detected from IP: ${req.ip}`);
-        return res.status(400).json({
+		return res.status(400).json({
           success: false,
           error: 'Invalid or potentially malicious JSON structure detected'
         });
       }
 
+	  const depth = calculateDepth(sanitizedMetadata);
+	  if (depth > 50) {
+		return res.status(400).json({
+		  success: false,
+		  error: 'Folder structure exceeds maximum depth (50 levels)'
+		});
+	  }
+
       const folderValidation = security.validateFolderStructure(sanitizedMetadata);
       if (!folderValidation.valid) {
+        console.log(`[${req.id}] Invalid folder structure:`, folderValidation.errors);
         return res.status(400).json({
           success: false,
           error: 'Invalid folder structure',
@@ -282,14 +327,34 @@ app.post('/api/upload',
         });
       }
 
+      // FIX [S-9]: Generate idempotency key
+      const idempotencyKey = crypto.createHash('sha256')
+        .update(sanitizedToken + JSON.stringify(sanitizedMetadata))
+        .digest('hex');
+      
+      // Check idempotency cache
+      if (!global.idempotencyCache) {
+        global.idempotencyCache = new Map();
+      }
+      
+      const cachedResult = global.idempotencyCache.get(idempotencyKey);
+      if (cachedResult && Date.now() - cachedResult.timestamp < 3600000) {
+        console.log(`[${req.id}] Returning cached result for idempotent request`);
+        return res.json(cachedResult.response);
+      }
+
       const existingBot = storage.getBotByToken(sanitizedToken);
       const isUpdate = !!existingBot;
+
+      let responseData;
 
       if (isUpdate) {
         const changePercentage = storage.calculateChangePercentage(
           existingBot.metadata,
           sanitizedMetadata
         );
+
+        console.log(`[${req.id}] Updating bot ${sanitizedUsername} (${changePercentage.toFixed(1)}% changes)`);
 
         if (changePercentage > 30) {
           await adminBot.sendAlert('update', 
@@ -303,12 +368,12 @@ app.post('/api/upload',
           changePercentage
         });
 
-        return res.json({
+        responseData = {
           success: true,
           message: 'Bot metadata updated successfully',
           isUpdate: true,
           changePercentage
-        });
+        };
       } else {
         const botId = storage.createBot({
           botToken: sanitizedToken,
@@ -319,22 +384,42 @@ app.post('/api/upload',
           createdAt: new Date().toISOString()
         });
 
+        console.log(`[${req.id}] New bot created: ${sanitizedUsername} (ID: ${botId})`);
+
         await botManager.addBot(botId, sanitizedToken, sanitizedChannelId, sanitizedMetadata);
 
         await adminBot.sendAlert('new_bot', 
           `New bot created: ${sanitizedUsername}\nBot ID: ${botId}\nStatus: Pending approval`
         );
 
-        return res.json({
+        responseData = {
           success: true,
           message: 'Bot created successfully. Awaiting admin approval.',
           botId,
           status: 'pending'
-        });
+        };
       }
 
+      // FIX [S-9]: Cache the result with 1-hour expiry
+      global.idempotencyCache.set(idempotencyKey, {
+        response: responseData,
+        timestamp: Date.now()
+      });
+
+      // FIX [S-9]: Cleanup old cache entries to prevent memory leaks
+      if (global.idempotencyCache.size > 1000) {
+        const now = Date.now();
+        for (const [key, value] of global.idempotencyCache.entries()) {
+          if (now - value.timestamp > 3600000) {
+            global.idempotencyCache.delete(key);
+          }
+        }
+      }
+
+      return res.json(responseData);
+
     } catch (error) {
-      console.error('Upload error:', error);
+      console.error(`[${req.id}] Upload error:`, error);
       await adminBot.sendAlert('error', `Upload endpoint error: ${error.message}`);
       
       return res.status(500).json({
@@ -348,9 +433,12 @@ app.post('/api/upload',
 // Bot status check endpoint
 app.get('/api/bot-status/:botToken', async (req, res) => {
   try {
+    console.log(`[${req.id}] Bot status check from ${req.ip}`);
+    
     const botToken = security.sanitizeInput(req.params.botToken);
     
     if (!botToken || !security.isValidBotToken(botToken)) {
+      console.log(`[${req.id}] Invalid bot token format`);
       return res.status(400).json({
         success: false,
         error: 'Invalid bot token format'
@@ -360,12 +448,14 @@ app.get('/api/bot-status/:botToken', async (req, res) => {
     const bot = storage.getBotByToken(botToken);
 
     if (!bot) {
+      console.log(`[${req.id}] Bot not found`);
       return res.status(404).json({
         success: false,
         error: 'Bot not found'
       });
     }
 
+    console.log(`[${req.id}] Bot status: ${bot.status}`);
     return res.json({
       success: true,
       status: bot.status,
@@ -376,7 +466,7 @@ app.get('/api/bot-status/:botToken', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Status check error:', error);
+    console.error(`[${req.id}] Status check error:`, error);
     return res.status(500).json({
       success: false,
       error: 'Error checking bot status'
@@ -384,12 +474,15 @@ app.get('/api/bot-status/:botToken', async (req, res) => {
   }
 });
 
-// MAJOR FIX #6: Bot metadata endpoint with rate limiting
+// Bot metadata endpoint with rate limiting
 app.get('/api/bot-metadata/:botToken', metadataLimiter, async (req, res) => {
   try {
+    console.log(`[${req.id}] Metadata fetch from ${req.ip}`);
+    
     const botToken = security.sanitizeInput(req.params.botToken);
     
     if (!botToken || !security.isValidBotToken(botToken)) {
+      console.log(`[${req.id}] Invalid bot token format`);
       return res.status(400).json({
         success: false,
         error: 'Invalid bot token format'
@@ -399,12 +492,14 @@ app.get('/api/bot-metadata/:botToken', metadataLimiter, async (req, res) => {
     const bot = storage.getBotByToken(botToken);
 
     if (!bot) {
+      console.log(`[${req.id}] Bot not found`);
       return res.status(404).json({
         success: false,
         error: 'Bot not found'
       });
     }
 
+    console.log(`[${req.id}] Metadata fetched for bot ${bot.botUsername}`);
     return res.json({
       success: true,
       botId: bot.id,
@@ -415,7 +510,7 @@ app.get('/api/bot-metadata/:botToken', metadataLimiter, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Metadata fetch error:', error);
+    console.error(`[${req.id}] Metadata fetch error:`, error);
     return res.status(500).json({
       success: false,
       error: 'Error fetching bot metadata'
@@ -428,6 +523,7 @@ app.use('/api/admin', adminRoutes.getRouter());
 
 // ERROR HANDLING
 app.use((req, res) => {
+  console.log(`[${req.id}] 404 Not Found: ${req.method} ${req.path}`);
   res.status(404).json({
     success: false,
     error: 'Not found'
@@ -435,7 +531,7 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  console.error(`[${req.id}] Unhandled error:`, err);
   
   const isDevelopment = process.env.NODE_ENV !== 'production';
   
@@ -450,7 +546,7 @@ app.use((err, req, res, next) => {
 
 // SERVER INITIALIZATION
 
-// MAJOR FIX #7: Environment validation before startup
+// Environment validation before startup
 function validateEnvironment() {
   const errors = [];
   
@@ -464,7 +560,6 @@ function validateEnvironment() {
     errors.push('ADMIN_PASSWORD must be at least 12 characters');
   }
   
-  // CRITICAL FIX #7: Validate PASSWORD_SALT
   if (!process.env.PASSWORD_SALT) {
     errors.push('PASSWORD_SALT not set (required for password hashing)');
   } else if (process.env.PASSWORD_SALT.length < 32) {
@@ -515,9 +610,12 @@ async function startServer() {
       ).catch(console.error);
     });
 
-    server.timeout = 120000;
-    server.keepAliveTimeout = 65000;
-    server.headersTimeout = 66000;
+    // FIX [S-5]: Use configurable timeout values from environment
+    server.timeout = SERVER_TIMEOUT;
+    server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT;
+    server.headersTimeout = HEADERS_TIMEOUT;
+
+    console.log(`✓ Server timeouts configured (timeout: ${SERVER_TIMEOUT}ms, keepAlive: ${KEEP_ALIVE_TIMEOUT}ms, headers: ${HEADERS_TIMEOUT}ms)`);
 
   } catch (error) {
     console.error('Failed to start server:', error);
@@ -577,6 +675,23 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
   adminBot.sendAlert('error', `Unhandled rejection: ${reason}`).catch(console.error);
 });
+
+// FIX [S-9]: Periodic cleanup of idempotency cache
+setInterval(() => {
+  if (global.idempotencyCache) {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, value] of global.idempotencyCache.entries()) {
+      if (now - value.timestamp > 3600000) {
+        global.idempotencyCache.delete(key);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      console.log(`Cleaned ${cleaned} expired idempotency cache entries`);
+    }
+  }
+}, 600000); // Every 10 minutes
 
 startServer();
 
