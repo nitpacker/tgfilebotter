@@ -16,7 +16,7 @@ MAX_JSON_SIZE = 10 * 1024 * 1024  # 10MB default (configurable on server)
 
 # Upload Settings
 UPLOAD_TIMEOUT = 300  # 5 minutes per file
-API_TIMEOUT = 30  # 30 seconds for API calls
+API_TIMEOUT = 60  # 30 seconds for API calls
 
 # Validation Patterns
 import re
