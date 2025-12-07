@@ -1,5 +1,10 @@
 """
 Builds and manages JSON metadata for bot file structure.
+FIXED VERSION - All security issues addressed:
+- [JB-10] from_json validates parsed structure
+- [JB-1] Uses SHA256 instead of MD5
+- [JB-3] All recursive methods have depth limits
+- [JB-14] File ID format validation added
 """
 
 import json
@@ -30,11 +35,18 @@ class JsonBuilder:
         }
         return self.metadata
     
-    def clean_metadata_for_server(self, structure: Dict[str, Any]) -> Dict[str, Any]:
+    def clean_metadata_for_server(self, structure: Dict[str, Any], depth: int = 0, max_depth: int = 50) -> Dict[str, Any]:
         """
         Remove local file paths from metadata before sending to server.
         Server only needs: fileName, fileId, messageId
+        
+        FIXED [JB-3]: Added depth limit to prevent stack overflow
+        FIXED [JB-14]: Added file ID validation
         """
+        # FIXED [JB-3]: Check depth limit
+        if depth > max_depth:
+            raise ValueError(f'Maximum structure depth ({max_depth}) exceeded')
+        
         cleaned = {
             'files': [],
             'subfolders': {}
@@ -42,22 +54,60 @@ class JsonBuilder:
         
         # Clean files
         for f in structure.get('files', []):
+            file_id = f.get('fileId')
+            message_id = f.get('messageId')
+            file_name = f.get('fileName')
+            
+            # FIXED [JB-14]: Validate file IDs before adding
+            if file_id and message_id:
+                if not self._validate_file_id(file_id, message_id):
+                    raise ValueError(f'Invalid file_id or message_id for {file_name}')
+            
             cleaned['files'].append({
-                'fileName': f.get('fileName'),
-                'fileId': f.get('fileId'),
-                'messageId': f.get('messageId')
+                'fileName': file_name,
+                'fileId': file_id,
+                'messageId': message_id
             })
         
-        # Clean subfolders recursively
+        # Clean subfolders recursively with depth tracking
         for name, subfolder in structure.get('subfolders', {}).items():
-            cleaned['subfolders'][name] = self.clean_metadata_for_server(subfolder)
+            # FIXED [JB-3]: Pass incremented depth to recursive call
+            cleaned['subfolders'][name] = self.clean_metadata_for_server(subfolder, depth + 1, max_depth)
         
         return cleaned
     
+    def _validate_file_id(self, file_id: str, message_id: int) -> bool:
+        """
+        FIXED [JB-14]: Validate file ID and message ID format.
+        
+        Args:
+            file_id: Telegram file_id string
+            message_id: Telegram message_id integer
+            
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        # Validate file_id
+        if not file_id or not isinstance(file_id, str):
+            return False
+        if len(file_id) < 10:  # Telegram file_ids are long strings
+            return False
+        
+        # Validate message_id
+        if not isinstance(message_id, int) or message_id <= 0:
+            return False
+        
+        return True
+    
     def calculate_file_hash(self, file_info: Dict) -> str:
-        """Calculate a hash for a file based on name and size."""
+        """
+        Calculate a hash for a file based on name and size.
+        
+        FIXED [JB-1]: Changed from MD5 to SHA256 for better security
+        """
         data = f"{file_info.get('fileName', '')}:{file_info.get('fileSize', 0)}"
-        return hashlib.md5(data.encode()).hexdigest()
+        # FIXED [JB-1]: Use SHA256 instead of MD5
+        return hashlib.sha256(data.encode()).hexdigest()
     
     def compare_structures(
         self,
@@ -109,9 +159,19 @@ class JsonBuilder:
     def _extract_files_with_paths(
         self, 
         structure: Dict[str, Any], 
-        current_path: str = ""
+        current_path: str = "",
+        depth: int = 0,
+        max_depth: int = 50
     ) -> Dict[str, Dict]:
-        """Extract all files with their relative paths as keys."""
+        """
+        Extract all files with their relative paths as keys.
+        
+        FIXED [JB-3]: Added depth limit to prevent stack overflow
+        """
+        # FIXED [JB-3]: Check depth limit
+        if depth > max_depth:
+            raise ValueError(f'Maximum structure depth ({max_depth}) exceeded')
+        
         files = {}
         
         for f in structure.get('files', []):
@@ -120,7 +180,8 @@ class JsonBuilder:
         
         for name, subfolder in structure.get('subfolders', {}).items():
             sub_path = f"{current_path}/{name}" if current_path else name
-            files.update(self._extract_files_with_paths(subfolder, sub_path))
+            # FIXED [JB-3]: Pass incremented depth to recursive call
+            files.update(self._extract_files_with_paths(subfolder, sub_path, depth + 1, max_depth))
         
         return files
     
@@ -145,7 +206,14 @@ class JsonBuilder:
                 }
         
         # Apply existing IDs to unchanged files in new structure
-        def apply_ids(structure: Dict, current_path: str = "") -> Dict:
+        def apply_ids(structure: Dict, current_path: str = "", depth: int = 0, max_depth: int = 50) -> Dict:
+            """
+            FIXED [JB-3]: Added depth limit to nested function
+            """
+            # FIXED [JB-3]: Check depth limit
+            if depth > max_depth:
+                raise ValueError(f'Maximum structure depth ({max_depth}) exceeded')
+            
             result = {
                 'files': [],
                 'subfolders': {}
@@ -171,7 +239,8 @@ class JsonBuilder:
             
             for name, subfolder in structure.get('subfolders', {}).items():
                 sub_path = f"{current_path}/{name}" if current_path else name
-                result['subfolders'][name] = apply_ids(subfolder, sub_path)
+                # FIXED [JB-3]: Pass incremented depth to recursive call
+                result['subfolders'][name] = apply_ids(subfolder, sub_path, depth + 1, max_depth)
             
             return result
         
@@ -201,7 +270,15 @@ class JsonBuilder:
         file_id: str,
         message_id: int
     ) -> bool:
-        """Update a file in the structure with its uploaded IDs."""
+        """
+        Update a file in the structure with its uploaded IDs.
+        
+        FIXED [JB-14]: Added validation of file IDs before updating
+        """
+        # FIXED [JB-14]: Validate file IDs before updating
+        if not self._validate_file_id(file_id, message_id):
+            raise ValueError(f'Invalid file_id or message_id for {file_path}')
+        
         # Search in files
         for f in structure.get('files', []):
             if f.get('filePath') == file_path or f.get('relativePath') == file_path:
@@ -224,8 +301,24 @@ class JsonBuilder:
         return json.dumps(cleaned, ensure_ascii=False)
     
     def from_json(self, json_str: str) -> Dict[str, Any]:
-        """Parse JSON string to structure."""
-        return json.loads(json_str)
+        """
+        Parse JSON string to structure.
+        
+        FIXED [JB-10]: Added validation of parsed structure
+        """
+        result = json.loads(json_str)
+        
+        # FIXED [JB-10]: Validate structure
+        if not isinstance(result, dict):
+            raise ValueError('Invalid JSON structure: expected object, got ' + type(result).__name__)
+        
+        # FIXED [JB-10]: Validate required keys exist
+        if 'subfolders' not in result:
+            raise ValueError('Invalid metadata: missing "subfolders" key')
+        if 'files' not in result:
+            raise ValueError('Invalid metadata: missing "files" key')
+        
+        return result
     
     def calculate_change_percentage(self, changes: Dict[str, Any]) -> float:
         """Calculate percentage of changes."""
