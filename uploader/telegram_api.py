@@ -1,15 +1,20 @@
 """
-Telegram Bot API wrapper for file uploads (PRODUCTION-READY - ALL FIXES APPLIED).
+Telegram Bot API wrapper for file uploads.
+Fixes applied:
+- [TG-2] URL parameter sanitization for tokens
+- [TG-8] Distinguish permanent vs transient errors
+- [TG-14] Cap exponential backoff to prevent excessive waits
 """
 
 import requests
 import os
 import time
 import logging
+import urllib.parse
 from typing import Optional, Dict, Any, Callable
 from config import MAX_FILE_SIZE, UPLOAD_TIMEOUT
 
-# MAJOR FIX #8: Configure logging to not expose tokens
+# Configure logging to not expose tokens
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -23,20 +28,32 @@ class TelegramAPI:
         self.api_url = f"{self.BASE_URL}{bot_token}"
         self._bot_info = None
         
-        # MAJOR FIX #8: Safe token prefix extraction
+        # Safe token prefix extraction
         if len(bot_token) > 12:
             self._token_prefix = bot_token[:4] + "..." + bot_token[10:12]
         else:
             self._token_prefix = "****"
     
     def _sanitize_error(self, error_msg: str) -> str:
-        """MAJOR FIX #8: Remove token from error messages."""
-        if self.bot_token in str(error_msg):
-            error_msg = str(error_msg).replace(self.bot_token, f"{self._token_prefix}****")
-        return error_msg
+        """
+        FIX [TG-2]: Remove token from error messages, including URL-encoded versions.
+        Sanitizes both raw token and URL-encoded token in error messages.
+        """
+        error_str = str(error_msg)
+        
+        # Replace raw token
+        if self.bot_token in error_str:
+            error_str = error_str.replace(self.bot_token, f"{self._token_prefix}****")
+        
+        # FIX [TG-2]: Check for URL-encoded token
+        encoded_token = urllib.parse.quote(self.bot_token)
+        if encoded_token in error_str:
+            error_str = error_str.replace(encoded_token, f"{self._token_prefix}****")
+        
+        return error_str
     
     def _log_error(self, message: str, error: Exception = None):
-        """MAJOR FIX #8: Log errors without exposing tokens."""
+        """Log errors without exposing tokens."""
         sanitized_msg = self._sanitize_error(message)
         if error:
             sanitized_error = self._sanitize_error(str(error))
@@ -61,7 +78,7 @@ class TelegramAPI:
                     'bot_id': self._bot_info.get('id')
                 }
             else:
-                # MAJOR FIX #8: Don't expose token in error
+                # Don't expose token in error
                 error_desc = data.get('description', 'Invalid token')
                 self._log_error(f"Token validation failed: {error_desc}")
                 return {
@@ -198,7 +215,8 @@ class TelegramAPI:
     ) -> Dict[str, Any]:
         """
         Upload a file to the channel with retry logic.
-        MAJOR FIX #8: Exponential backoff and better error handling.
+        FIX [TG-8]: Distinguish permanent vs transient errors
+        FIX [TG-14]: Cap exponential backoff to prevent excessive waits
         """
         if not os.path.exists(file_path):
             return {'success': False, 'error': 'File not found'}
@@ -216,6 +234,19 @@ class TelegramAPI:
         
         file_name = os.path.basename(file_path)
         
+        # FIX [TG-8]: List of permanent errors that should NOT be retried
+        permanent_errors = [
+            'not found',
+            'invalid token',
+            'forbidden',
+            'bot was blocked',
+            'chat not found',
+            'file_id',
+            'bad request: wrong file identifier',
+            'bad request: file is too big',
+            'unauthorized'
+        ]
+        
         # Retry with exponential backoff
         for attempt in range(max_retries):
             try:
@@ -223,7 +254,7 @@ class TelegramAPI:
                     files = {'document': (file_name, f)}
                     data = {'chat_id': channel_id}
                     
-                    # MAJOR FIX #8: Adjust timeout based on file size
+                    # Adjust timeout based on file size
                     timeout = min(UPLOAD_TIMEOUT, max(60, file_size / 1024 / 1024 * 2))
                     
                     resp = requests.post(
@@ -251,7 +282,26 @@ class TelegramAPI:
                                 else:
                                     file_id = media.get('file_id')
                                 break
-                    
+                                
+                    if not file_id:
+                        return {
+                            'success': False,
+                            'error': 'Failed to get file_id from Telegram response'
+                        }
+    
+                    if not isinstance(file_id, str) or len(file_id) < 10:
+                        return {
+                            'success': False,
+                            'error': f'Invalid file_id format from Telegram: {file_id}'
+                        }
+    
+                    message_id = message.get('message_id')
+                    if not isinstance(message_id, int) or message_id <= 0:
+                        return {
+                            'success': False,
+                            'error': f'Invalid message_id from Telegram: {message_id}'
+                        }
+                        
                     return {
                         'success': True,
                         'file_id': file_id,
@@ -262,8 +312,14 @@ class TelegramAPI:
                     error = result.get('description', 'Upload failed')
                     friendly_error = self._translate_error(error)
                     
+                    # FIX [TG-8]: Check if this is a permanent error - don't retry
+                    error_lower = error.lower()
+                    if any(perm_err in error_lower for perm_err in permanent_errors):
+                        logger.warning(f"Permanent error detected, not retrying: {error}")
+                        return {'success': False, 'error': friendly_error}
+                    
                     # Handle rate limiting with retry
-                    if 'retry after' in error.lower():
+                    if 'retry after' in error_lower:
                         retry_after = result.get('parameters', {}).get('retry_after', 30)
                         
                         if attempt < max_retries - 1:
@@ -277,10 +333,11 @@ class TelegramAPI:
                             'retry_after': retry_after
                         }
                     
-                    # Retry on temporary errors
-                    if attempt < max_retries - 1 and any(err in error.lower() for err in ['timeout', 'network', 'temporary']):
-                        wait_time = (2 ** attempt) * 5  # Exponential backoff: 5s, 10s, 20s
-                        logger.warning(f"Upload failed, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    # FIX [TG-8]: Only retry transient errors
+                    if attempt < max_retries - 1:
+                        # FIX [TG-14]: Cap wait time to prevent excessive delays (max 5 minutes)
+                        wait_time = min((2 ** attempt) * 5, 300)
+                        logger.warning(f"Transient error, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait_time)
                         continue
                     
@@ -288,7 +345,8 @@ class TelegramAPI:
                     
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 5
+                    # FIX [TG-14]: Cap wait time to max 5 minutes
+                    wait_time = min((2 ** attempt) * 5, 300)
                     logger.warning(f"Upload timed out, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
                     time.sleep(wait_time)
                     continue
@@ -297,7 +355,8 @@ class TelegramAPI:
                 
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 5
+                    # FIX [TG-14]: Cap wait time to max 5 minutes
+                    wait_time = min((2 ** attempt) * 5, 300)
                     self._log_error(f"Upload request failed, retrying in {wait_time}s", e)
                     time.sleep(wait_time)
                     continue
