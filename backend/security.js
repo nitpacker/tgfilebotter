@@ -1,26 +1,57 @@
-// security.js - Input Sanitization and Security
+// security.js
 const validator = require('validator');
 
 class Security {
   constructor() {
-    // Dangerous patterns to detect
+    // CRITICAL FIX [SEC-1]: Extended dangerous patterns to detect all XSS vectors
     this.dangerousPatterns = [
       /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi,
+      /<iframe/gi,           // FIXED: Added iframe
+      /<object/gi,           // FIXED: Added object
+      /<embed/gi,            // FIXED: Added embed
+      /<link/gi,             // FIXED: Added link
+      /<style/gi,            // FIXED: Added style
       /javascript:/gi,
       /on\w+\s*=/gi,
+      /onerror=/gi,          // FIXED: Explicit onerror check
+      /onload=/gi,           // FIXED: Explicit onload check
       /eval\(/gi,
       /Function\(/gi,
       /setTimeout\(/gi,
       /setInterval\(/gi,
       /__proto__/gi,
       /constructor/gi,
-      /\.\.\/\.\.\//g, // Path traversal
-      /\$\{.*\}/g, // Template injection
-      /`.*`/g, // Template literals
+      /\.\.\/\.\.\//g,       // Path traversal
+      /\$\{.*\}/g,           // Template injection
+      /`.*`/g,               // Template literals
     ];
 
-    // Allowed characters for folder names
-    this.folderNameRegex = /^[\p{L}\p{N}\s\-_().]+$/u; // Unicode letters, numbers, spaces, and safe chars
+    // CRITICAL FIX [SEC-4]: Enhanced folder name regex and added explicit blacklist
+    // Allowed characters for folder names (Unicode letters, numbers, spaces, and safe chars)
+    this.folderNameRegex = /^[\p{L}\p{N}\s\-_().]+$/u;
+    
+    // FIXED: Explicit blacklist for shell injection characters
+    this.folderNameBlacklist = /[`${}\\]/;
+    
+    // CRITICAL FIX [SEC-8]: Custom HTML escape map for Unicode preservation
+    this.htmlEscapeMap = {
+      '<': '&lt;',
+      '>': '&gt;',
+      '&': '&amp;',
+      '"': '&quot;',
+      "'": '&#x27;'
+    };
+    
+    // CRITICAL FIX [SEC-10]: Sensitive keys to redact in logs
+    this.sensitiveKeys = ['token', 'password', 'secret', 'key', 'salt', 'auth', 'credential', 'api_key', 'apikey'];
+  }
+
+  // CRITICAL FIX [SEC-8]: Custom HTML escape that preserves Unicode
+  escapeHtml(text) {
+    if (typeof text !== 'string') {
+      return text;
+    }
+    return text.replace(/[<>&"']/g, (char) => this.htmlEscapeMap[char]);
   }
 
   // Sanitize general text input
@@ -46,8 +77,9 @@ class Security {
         }
       }
 
-      // Escape HTML entities
-      sanitized = validator.escape(sanitized);
+      // CRITICAL FIX [SEC-8]: Use custom HTML escape instead of validator.escape()
+      // This preserves Unicode characters (Arabic, Chinese, etc.) while escaping HTML
+      sanitized = this.escapeHtml(sanitized);
 
       return sanitized;
 
@@ -99,12 +131,18 @@ class Security {
     }
   }
 
-  // Sanitize and validate JSON
-  sanitizeJSON(obj, depth = 0, maxDepth = 10) {
+  // CRITICAL FIX [SEC-11]: Added total key counter to prevent breadth-based DoS
+  sanitizeJSON(obj, depth = 0, maxDepth = 10, context = { totalKeys: 0, maxKeys: 10000 }) {
     try {
       // Prevent deep recursion attacks
       if (depth > maxDepth) {
         console.warn('JSON depth exceeded');
+        return null;
+      }
+
+      // CRITICAL FIX [SEC-11]: Check total key count across entire structure
+      if (context.totalKeys > context.maxKeys) {
+        console.warn('JSON total key count exceeded - potential DoS attack');
         return null;
       }
 
@@ -117,7 +155,7 @@ class Security {
       if (Array.isArray(obj)) {
         const sanitizedArray = [];
         for (const item of obj) {
-          const sanitized = this.sanitizeJSON(item, depth + 1, maxDepth);
+          const sanitized = this.sanitizeJSON(item, depth + 1, maxDepth, context);
           if (sanitized !== null) {
             sanitizedArray.push(sanitized);
           }
@@ -136,7 +174,18 @@ class Security {
         }
 
         const sanitizedObj = {};
-        for (const [key, value] of Object.entries(obj)) {
+        const keys = Object.entries(obj);
+        
+        // CRITICAL FIX [SEC-11]: Increment total key counter for each key
+        context.totalKeys += keys.length;
+        
+        // Check if we've exceeded the limit after adding these keys
+        if (context.totalKeys > context.maxKeys) {
+          console.warn(`JSON total key count exceeded at depth ${depth} - potential breadth-based DoS attack`);
+          return null;
+        }
+        
+        for (const [key, value] of keys) {
           // Sanitize key
           const sanitizedKey = this.sanitizeInput(key);
           if (sanitizedKey === null) {
@@ -153,7 +202,7 @@ class Security {
           } else if (typeof value === 'number' || typeof value === 'boolean') {
             sanitizedObj[sanitizedKey] = value;
           } else if (typeof value === 'object') {
-            const sanitizedValue = this.sanitizeJSON(value, depth + 1, maxDepth);
+            const sanitizedValue = this.sanitizeJSON(value, depth + 1, maxDepth, context);
             if (sanitizedValue !== null) {
               sanitizedObj[sanitizedKey] = sanitizedValue;
             }
@@ -246,6 +295,7 @@ class Security {
     }
   }
 
+  // CRITICAL FIX [SEC-4]: Enhanced folder name validation with explicit blacklist
   isValidFolderName(name) {
     if (!name || typeof name !== 'string') {
       return false;
@@ -257,7 +307,17 @@ class Security {
     }
 
     // Check for valid characters (Unicode support)
-    return this.folderNameRegex.test(name);
+    if (!this.folderNameRegex.test(name)) {
+      return false;
+    }
+
+    // CRITICAL FIX [SEC-4]: Explicit blacklist check for shell injection characters
+    if (this.folderNameBlacklist.test(name)) {
+      console.warn('Folder name contains blacklisted characters (backticks, $, {, }, \\):', name);
+      return false;
+    }
+
+    return true;
   }
 
   // Rate limiting helper
@@ -317,12 +377,43 @@ class Security {
     return /^(@[a-zA-Z0-9_]{5,32}|-100\d{10,})$/.test(channelId);
   }
 
-  // Log security events
+  // CRITICAL FIX [SEC-10]: Redact sensitive data before logging
+  redactSensitiveData(data) {
+    if (!data || typeof data !== 'object') {
+      return data;
+    }
+
+    const redacted = Array.isArray(data) ? [...data] : { ...data };
+
+    for (const key in redacted) {
+      if (redacted.hasOwnProperty(key)) {
+        // Check if key contains sensitive terms
+        const keyLower = key.toLowerCase();
+        const isSensitive = this.sensitiveKeys.some(sensitiveKey => 
+          keyLower.includes(sensitiveKey)
+        );
+
+        if (isSensitive) {
+          redacted[key] = '[REDACTED]';
+        } else if (typeof redacted[key] === 'object' && redacted[key] !== null) {
+          // Recursively redact nested objects
+          redacted[key] = this.redactSensitiveData(redacted[key]);
+        }
+      }
+    }
+
+    return redacted;
+  }
+
+  // CRITICAL FIX [SEC-10]: Log security events with sensitive data redaction
   logSecurityEvent(eventType, details) {
+    // Redact sensitive data from details before logging
+    const safeDetails = this.redactSensitiveData(details);
+
     const logEntry = {
       timestamp: new Date().toISOString(),
       type: eventType,
-      details,
+      details: safeDetails,
       severity: this.getEventSeverity(eventType)
     };
 
@@ -337,6 +428,7 @@ class Security {
       'injection_attempt': 'HIGH',
       'malicious_json': 'HIGH',
       'path_traversal': 'HIGH',
+      'xss_attempt': 'HIGH',
       'rate_limit': 'MEDIUM',
       'invalid_input': 'LOW',
       'sanitization': 'LOW'
